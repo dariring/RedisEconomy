@@ -1,10 +1,10 @@
 plugins {
     id 'java'
-    id 'io.github.goooler.shadow' version "8.1.7"
+    id 'com.gradleup.shadow' version "9.6.1"
 }
 
 group = 'dev.unnm3d'
-version = '4.5.11'
+version = '4.5.13'
 
 repositories {
     mavenCentral()
@@ -26,7 +26,6 @@ dependencies {
     compileOnly 'io.papermc.paper:paper-api:1.17-R0.1-SNAPSHOT'
     compileOnly 'org.projectlombok:lombok:1.18.34'
     compileOnly 'net.kyori:adventure-text-minimessage:4.25.0'
-    implementation 'net.kyori:adventure-platform-bukkit:4.4.1'
     implementation 'io.lettuce:lettuce-core:6.8.2.RELEASE'
     implementation 'de.exlll:configlib-yaml:4.6.1'
     implementation 'com.github.Anon8281:UniversalScheduler:0.1.6'
@@ -46,7 +45,6 @@ jar {
 
 shadowJar {
     dependencies{
-        exclude(dependency('net.kyori:adventure-platform-viaversion'))
         exclude(dependency('net.kyori:adventure-text-minimessage'))
         exclude(dependency('net.kyori:adventure-text-serializer-legacy'))
         exclude(dependency('net.kyori:adventure-text-serializer-json'))
@@ -63,7 +61,6 @@ shadowJar {
     destinationDirectory.set(file("$rootDir/target"))
     archiveClassifier.set('')
 
-    relocate 'net.kyori.adventure.platform', 'dev.unnm3d.shaded.kyori.adventure.platform'
     relocate 'de.exlll.configlib', 'dev.unnm3d.shaded.configlib'
     relocate 'org.snakeyaml.engine', 'dev.unnm3d.shaded.snakeyaml'
     relocate 'reactor', 'dev.unnm3d.shaded.lettucedep.reactor'
@@ -76,21 +73,12 @@ shadowJar {
 }
 
 def targetJavaVersion = 21
-java {
-    def javaVersion = JavaVersion.toVersion(targetJavaVersion)
-    sourceCompatibility = javaVersion
-    targetCompatibility = javaVersion
-    if (JavaVersion.current() < javaVersion) {
-        toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
-    }
-}
 
+// Compile against the Java 21 API regardless of which JDK runs Gradle, so the
+// build works on both a JDK 21 and a newer JDK (25+) without a toolchain lookup.
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
-
-    if (targetJavaVersion >= 10 || JavaVersion.current().isJava10Compatible()) {
-        options.release.set(targetJavaVersion)
-    }
+    options.release.set(targetJavaVersion)
 }
 
 processResources {
