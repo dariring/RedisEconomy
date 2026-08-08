@@ -24,7 +24,7 @@ repositories {
 
 dependencies {
     compileOnly 'io.papermc.paper:paper-api:1.17-R0.1-SNAPSHOT'
-    compileOnly 'org.projectlombok:lombok:1.18.34'
+    compileOnly 'org.projectlombok:lombok:1.18.46'
     compileOnly 'net.kyori:adventure-text-minimessage:4.25.0'
     implementation 'io.lettuce:lettuce-core:6.8.2.RELEASE'
     implementation 'de.exlll:configlib-yaml:4.6.1'
@@ -36,7 +36,7 @@ dependencies {
     compileOnly 'com.github.Zrips:CMI-API:9.7.14.3'
     compileOnly(files('libs/XConomy-Bukkit-2.26.3.jar'))
 
-    annotationProcessor 'org.projectlombok:lombok:1.18.34'
+    annotationProcessor 'org.projectlombok:lombok:1.18.46'
 }
 
 jar {
