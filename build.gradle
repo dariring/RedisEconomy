@@ -6,6 +6,14 @@ plugins {
 group = 'dev.unnm3d'
 version = '4.5.13'
 
+// CI runs and retries must produce distinct versions, including in plugin metadata.
+def ciBuildNumber = providers.environmentVariable('GITHUB_RUN_NUMBER')
+    .orElse(providers.environmentVariable('BUILD_NUMBER'))
+if (ciBuildNumber.isPresent()) {
+    def ciBuildAttempt = providers.environmentVariable('GITHUB_RUN_ATTEMPT').orElse('1').get()
+    version = "${version}-build.${ciBuildNumber.get()}.$ciBuildAttempt"
+}
+
 repositories {
     mavenCentral()
     maven {
