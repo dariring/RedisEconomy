@@ -27,7 +27,7 @@ public class RoundRobinConnectionPool<K, V> {
     }
 
     public StatefulRedisConnection<K, V> get() {
-        int index = next.getAndIncrement() % elements.length;
+        int index = Math.floorMod(next.getAndIncrement(), elements.length);
         StatefulRedisConnection<K, V> connection = elements[index];
         if (connection != null)
             if (connection.isOpen())
@@ -44,6 +44,7 @@ public class RoundRobinConnectionPool<K, V> {
     public String printPool() {
         StringBuilder sb = new StringBuilder();
         for (StatefulRedisConnection<K, V> element : elements) {
+            if (element == null) continue; //Slot added by expandPool, connected on first use
             sb.append("Open: ")
                     .append(element.isOpen())
                     .append(", multi: ")
@@ -58,7 +59,7 @@ public class RoundRobinConnectionPool<K, V> {
 
     public void close() {
         for (StatefulRedisConnection<K, V> element : elements) {
-            element.closeAsync();
+            if (element != null) element.closeAsync();
         }
     }
 

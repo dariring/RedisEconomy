@@ -39,33 +39,31 @@ public class RedisManager {
         return redisCallBack.apply(roundRobinConnectionPool.get().sync());
     }
 
+    /**
+     * Runs the callback commands in order on a single connection.
+     * Connections are shared between threads, so setAutoFlushCommands must not be toggled here: it would
+     * leave other threads' commands unflushed until they time out, and forever if the callback throws.
+     */
     public <T> CompletionStage<T> getConnectionPipeline(Function<RedisAsyncCommands<String, String>, CompletionStage<T>> redisCallBack) {
-        StatefulRedisConnection<String, String> connection = roundRobinConnectionPool.get();
-        connection.setAutoFlushCommands(false);
-        CompletionStage<T> completionStage = redisCallBack.apply(connection.async());
-        connection.flushCommands();
-        connection.setAutoFlushCommands(true);
-        return completionStage;
+        return redisCallBack.apply(roundRobinConnectionPool.get().async());
     }
 
     /**
      * Executes a transaction with the given Redis commands consumer.
      * If there is an exception during the transaction, it will be discarded.
+     * It runs on its own connection: MULTI is per connection state, and pooled connections are shared with other threads.
      *
      * @param redisCommandsConsumer the consumer that will execute the Redis commands
      * @return an Optional containing the result of the redis transaction, or an empty Optional if the transaction was discarded
      */
     public Optional<List<Object>> executeTransaction(Consumer<RedisCommands<String, String>> redisCommandsConsumer) {
-        final RedisCommands<String, String> syncCommands = roundRobinConnectionPool.get().sync();
-        try {
+        try (StatefulRedisConnection<String, String> connection = lettuceRedisClient.connect()) {
+            final RedisCommands<String, String> syncCommands = connection.sync();
             syncCommands.multi();
             redisCommandsConsumer.accept(syncCommands);
             return Optional.of(syncCommands.exec())
                     .filter(result -> !result.wasDiscarded())
                     .map(result -> result.stream().toList());
-        } catch (Exception e) {
-            syncCommands.discard();
-            throw e;
         }
     }
 
