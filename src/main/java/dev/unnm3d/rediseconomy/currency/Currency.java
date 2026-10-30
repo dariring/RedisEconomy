@@ -65,6 +65,8 @@ public class Currency implements Economy {
      * KEYS: balances, name-uuids, sequence, last applied write of this executor
      * ARGV: account, D(elta) S(et) C(reate), value, balance if the account is not on Redis, write id, channel, message prefix, name
      * A retry after a timeout that actually committed is detected with the write id and not applied twice.
+     * The sequence starts from the clock: if Redis loses the key (restart without persistence, eviction) it must
+     * still be higher than what instances have seen, or they would ignore every later balance as old.
      */
     private static final String BALANCE_WRITE_SCRIPT = """
             if tonumber(redis.call('GET',KEYS[4]) or '0')>=tonumber(ARGV[5]) then
@@ -80,6 +82,9 @@ public class Currency implements Economy {
             end
             local b=redis.call('ZSCORE',KEYS[1],ARGV[1])
             if ARGV[8]~='' then redis.call('HSET',KEYS[2],ARGV[8],ARGV[1]) end
+            if redis.call('EXISTS',KEYS[3])==0 then
+              redis.call('SET',KEYS[3],redis.call('TIME')[1]*1000)
+            end
             redis.call('INCR',KEYS[3])
             local s=redis.call('GET',KEYS[3])
             redis.call('PUBLISH',ARGV[6],ARGV[7]..b..';;'..s)

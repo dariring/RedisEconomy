@@ -113,7 +113,8 @@ final class BalanceLedger<K> {
     synchronized void update(K key, double balance, long sequence) {
         final Entry entry = entry(key);
         if (sequence != UNSEQUENCED) {
-            if (sequence <= entry.sequence) return; //An older update, delivered late
+            //An older update, delivered late. Equal is a read of the current state, also after a change without sequence (restore)
+            if (sequence < entry.sequence) return;
             entry.sequence = sequence;
         }
         entry.committed = balance;
