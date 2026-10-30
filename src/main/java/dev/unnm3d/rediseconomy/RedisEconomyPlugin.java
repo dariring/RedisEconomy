@@ -181,11 +181,13 @@ public final class RedisEconomyPlugin extends JavaPlugin {
      * Load the player list manager if the tabOnlinePlayers setting is enabled
      */
     public void loadPlayerList() {
-        if (configManager.getSettings().tabOnlinePlayers) {
-            this.playerListManager = new PlayerListManager(this.redisManager, this);
-        } else if (playerListManager != null) {
+        //Every reload would leave a pub/sub connection and a repeating task behind
+        if (playerListManager != null) {
             playerListManager.stop();
             playerListManager = null;
+        }
+        if (configManager.getSettings().tabOnlinePlayers) {
+            this.playerListManager = new PlayerListManager(this.redisManager, this);
         }
     }
 
