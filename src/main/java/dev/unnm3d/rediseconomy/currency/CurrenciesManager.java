@@ -176,7 +176,8 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
             removeRedisNameUniqueIds(removed);
             if (resetBalance) {
                 for (Currency currency : currencies.values()) {
-                    removed.forEach((name, uuid) -> currency.setPlayerBalance(uuid, name, 0.0));
+                    //Without the name: it would store the name-uuid just removed again
+                    removed.forEach((name, uuid) -> currency.setPlayerBalance(uuid, null, 0.0));
                 }
             }
         }

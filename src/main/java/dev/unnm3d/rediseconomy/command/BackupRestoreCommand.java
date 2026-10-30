@@ -70,7 +70,9 @@ public class BackupRestoreCommand implements CommandExecutor, TabCompleter {
                                 accounts.put(split[0], new ArrayList<>(List.of(ScoredValue.just(Double.parseDouble(split[3]), split[1]))));
                             }
 
-                            nameUUIDs.put(split[2], split[1]);
+                            //Backups write "null" for accounts without a known name
+                            if (!split[2].isEmpty() && !split[2].equals("null"))
+                                nameUUIDs.put(split[2], split[1]);
                         }
                         plugin.getLogger().info(accounts.size() + " currency to restore");
 
