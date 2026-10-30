@@ -256,14 +256,12 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     @EventHandler
     private void onJoin(PlayerJoinEvent e) {
         getCurrencies().forEach(currency ->
-                currency.getAccountRedis(e.getPlayer().getUniqueId())
+                currency.refreshAccountLocal(e.getPlayer().getUniqueId(), e.getPlayer().getName())
                         .thenAccept(balance -> {
                             RedisEconomyPlugin.debug("00 Loaded " + e.getPlayer().getName() + "'s balance of " + balance + " " + currency.getCurrencyName());
 
                             if (balance == null) {
                                 currency.createPlayerAccount(e.getPlayer());
-                            } else {
-                                currency.updateAccountLocal(e.getPlayer().getUniqueId(), e.getPlayer().getName(), balance);
                             }
                         }).exceptionally(ex -> {
                             ex.printStackTrace();

@@ -9,6 +9,8 @@ public enum RedisKeys {
     BALANCE_PREFIX("rediseco:balances_"),
     BALANCE_BANK_PREFIX("rediseco:b_balances_"),
     BANK_OWNERS("rediseco:b_owners"),
+    BALANCE_SEQUENCE_PREFIX("rediseco:balance_seq_"),
+    APPLIED_WRITE_PREFIX("rediseco:applied_write_"),
     UPDATE_PLAYER_CHANNEL_PREFIX("rediseco:update_"),
     UPDATE_MAX_BAL_PREFIX("rediseco:update_max_"),
     UPDATE_BANK_CHANNEL_PREFIX("rediseco:b_update_"),
