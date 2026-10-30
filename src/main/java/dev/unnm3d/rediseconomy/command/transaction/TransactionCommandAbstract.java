@@ -4,6 +4,7 @@ import dev.unnm3d.rediseconomy.RedisEconomyPlugin;
 import dev.unnm3d.rediseconomy.currency.Currency;
 import dev.unnm3d.rediseconomy.transaction.Transaction;
 import lombok.AllArgsConstructor;
+import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.command.CommandSender;
 
 import java.text.ParseException;
@@ -37,7 +38,7 @@ public abstract class TransactionCommandAbstract {
                 .replace("%account-owner%", accountOwnerName == null ? "Unknown" : accountOwnerName)
                 .replace("%other-account%", otherAccount == null ? "Unknown" : otherAccount)
                 .replace("%timestamp%", convertTimeWithLocalTimeZome(transaction.getTimestamp()))
-                .replace("%reason%", transaction.getReason());
+                .replace("%reason%", MiniMessage.miniMessage().escapeTags(transaction.getReason())); //Players choose the reason of a payment
         if (timestampArgument != null)
             transactionMessage = transactionMessage.replace("%afterbefore%", timestampArgument);
         plugin.langs().send(sender, transactionMessage);

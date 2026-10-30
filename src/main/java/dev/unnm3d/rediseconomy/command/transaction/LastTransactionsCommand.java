@@ -4,6 +4,7 @@ import dev.unnm3d.rediseconomy.RedisEconomyPlugin;
 import dev.unnm3d.rediseconomy.currency.Currency;
 import dev.unnm3d.rediseconomy.transaction.AccountID;
 import dev.unnm3d.rediseconomy.transaction.Transaction;
+import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -61,7 +62,7 @@ public class LastTransactionsCommand extends TransactionCommandAbstract implemen
                 .replace("%account-owner%", accountOwnerName == null ? "Unknown" : accountOwnerName)
                 .replace("%other-account%", otherAccount == null ? "Unknown" : otherAccount)
                 .replace("%timestamp%", convertTimeWithLocalTimeZome(transaction.getTimestamp()))
-                .replace("%reason%", transaction.getReason());
+                .replace("%reason%", MiniMessage.miniMessage().escapeTags(transaction.getReason())); //Players choose the reason of a payment
         plugin.langs().send(sender, transactionMessage);
     }
 
