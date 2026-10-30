@@ -29,7 +29,7 @@ public class SwitchCurrencyCommand implements CommandExecutor, TabCompleter {
             return true;
         }
         Currency newCurrency = currenciesManager.getCurrencyByName(args[1]);
-        if (newCurrency == null) {
+        if (newCurrency == null || newCurrency == currency) {
             plugin.langs().send(sender, plugin.langs().invalidCurrency);
             return true;
         }

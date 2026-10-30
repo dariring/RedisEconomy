@@ -8,6 +8,7 @@ import dev.unnm3d.rediseconomy.redis.RedisKeys;
 import dev.unnm3d.rediseconomy.redis.RedisManager;
 import dev.unnm3d.rediseconomy.transaction.EconomyExchange;
 import io.lettuce.core.ScoredValue;
+import io.lettuce.core.ScriptOutputType;
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection;
 import lombok.Getter;
 import net.milkbowl.vault.economy.Economy;
@@ -339,19 +340,19 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
      * @param newCurrency The new currency to switch to
      */
     public void switchCurrency(Currency currency, Currency newCurrency) {
-        redisManager.getConnectionPipeline(asyncCommands -> {
-            asyncCommands.copy(RedisKeys.BALANCE_PREFIX + currency.getCurrencyName(),
-                            RedisKeys.BALANCE_PREFIX + currency.getCurrencyName() + "_backup")
-                    .thenAccept(success -> RedisEconomyPlugin.debug("Switch0 - Backup currency accounts: " + success));
-
-            asyncCommands.rename(RedisKeys.BALANCE_PREFIX + newCurrency.getCurrencyName(),
-                    RedisKeys.BALANCE_PREFIX + currency.getCurrencyName()).thenAccept(success ->
-                    RedisEconomyPlugin.debug("Switch1 - Overwrite new currency key with the old one: " + success));
-
-            asyncCommands.renamenx(RedisKeys.BALANCE_PREFIX + currency.getCurrencyName() + "_backup",
-                    RedisKeys.BALANCE_PREFIX + newCurrency.getCurrencyName()).thenAccept(success ->
-                    RedisEconomyPlugin.debug("Switch2 - Write the backup on the new currency key: " + success));
-            return null;
+        if (currency.getCurrencyName().equals(newCurrency.getCurrencyName())) return;
+        final String currencyKey = RedisKeys.BALANCE_PREFIX + currency.getCurrencyName();
+        //In one script: a key that doesn't exist must not leave the balances in both currencies or half swapped
+        redisManager.<Long>getConnectionAsync(asyncCommands -> asyncCommands.eval(
+                "local a=redis.call('EXISTS',KEYS[1])local b=redis.call('EXISTS',KEYS[2])" +
+                        "if a==1 then redis.call('RENAME',KEYS[1],KEYS[3])end " +
+                        "if b==1 then redis.call('RENAME',KEYS[2],KEYS[1])end " +
+                        "if a==1 then redis.call('RENAME',KEYS[3],KEYS[2])end return a+b",
+                ScriptOutputType.INTEGER,
+                new String[]{currencyKey, RedisKeys.BALANCE_PREFIX + newCurrency.getCurrencyName(), currencyKey + "_switching"}
+        )).whenComplete((swapped, throwable) -> {
+            if (throwable != null) plugin.getLogger().severe("Failed to switch currencies: " + throwable.getMessage());
+            else RedisEconomyPlugin.debug("Switch0 - Swapped currency accounts: " + swapped);
         });
     }
 
