@@ -12,7 +12,6 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.jetbrains.annotations.NotNull;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -26,13 +25,17 @@ public class BalanceTopCommand implements CommandExecutor, TabCompleter {
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
 
         int page = 1;
-        if (args.length == 1)
+        if (args.length >= 1)
             try {
                 page = Integer.parseInt(args[0]);
             } catch (NumberFormatException e) {
                 plugin.langs().send(sender, plugin.langs().missingArguments);
                 return true;
             }
+        if (page < 1) {
+            plugin.langs().send(sender, plugin.langs().missingArguments);
+            return true;
+        }
 
         Currency baltopCurrency = args.length == 2 ? currenciesManager.getCurrencyByName(args[1]) : currenciesManager.getDefaultCurrency();
 
@@ -47,7 +50,7 @@ public class BalanceTopCommand implements CommandExecutor, TabCompleter {
                 .thenApply(balances -> {
                     List<ScoredValue<String>> pageBalances;
                     if (balances.size() < (finalPage - 1) * 10) {//If the page is higher that the balances available
-                        return new ArrayList<ScoredValue<String>>();
+                        return new PageData(finalPage, List.<ScoredValue<String>>of());
                     } else if (balances.size() > finalPage * 10) {
                         pageBalances = balances.subList((finalPage - 1) * 10, finalPage * 10);
                     } else pageBalances = balances.subList((finalPage - 1) * 10, balances.size());
@@ -58,8 +61,7 @@ public class BalanceTopCommand implements CommandExecutor, TabCompleter {
 
                     return new PageData(finalPage, pageBalances);
                 })
-                .thenAccept((data) -> {
-                    PageData pageData = (PageData) data;
+                .thenAccept((pageData) -> {
                     int i = 1;
                     for (ScoredValue<String> tuple : pageData.pageBalances) {
                         String username = currenciesManager.getUsernameFromUUIDCache(UUID.fromString(tuple.getValue()));
