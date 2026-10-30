@@ -411,6 +411,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
      * @return the formatted amount
      */
     public double formatAmountString(String targetName, Currency currency, String amount) {
+        if (amount.isEmpty()) return -1;
         try {
             //Check if last char of amount is number
             if (Character.isDigit(amount.charAt(amount.length() - 1))) {

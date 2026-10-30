@@ -88,9 +88,17 @@ public abstract class BalanceCommand implements CommandExecutor, TabCompleter {
                 }
 
             } else if (args[2].equalsIgnoreCase("set")) {
+                if (amount < 0) {
+                    plugin.langs().send(sender, plugin.langs().invalidAmount);
+                    return true;
+                }
                 setPlayer(sender, currency, amount, target);
 
             } else if (args[2].equalsIgnoreCase("set-max")) {
+                if (amount < 0) {
+                    plugin.langs().send(sender, plugin.langs().invalidAmount);
+                    return true;
+                }
                 setPlayerMaxBalance(sender, currency, amount, target);
             }
         }
