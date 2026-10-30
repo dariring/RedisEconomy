@@ -90,6 +90,8 @@ public class CurrencyWithBanks extends Currency {
      * @return EconomyResponse with the result of the operation (SUCCESS)
      */
     public EconomyResponse createBank(@NotNull String accountId, UUID playerOwner, String reason) {
+        if (playerOwner == null)
+            return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Player not found");
         if (bankAccounts.containsKey(accountId))
             return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Bank account already exists");
         setOwner(accountId, playerOwner);
@@ -203,7 +205,8 @@ public class CurrencyWithBanks extends Currency {
 
     @Override
     public EconomyResponse isBankOwner(@NotNull String accountId, String playerName) {
-        if (bankOwners.getOrDefault(accountId, null).equals(currenciesManager.getUUIDFromUsernameCache(playerName))) {
+        final UUID owner = bankOwners.get(accountId);
+        if (owner != null && owner.equals(currenciesManager.getUUIDFromUsernameCache(playerName))) {
             return new EconomyResponse(0, 0, EconomyResponse.ResponseType.SUCCESS, null);
         }
         return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Not owner");
@@ -211,7 +214,8 @@ public class CurrencyWithBanks extends Currency {
 
     @Override
     public EconomyResponse isBankOwner(@NotNull String accountId, OfflinePlayer player) {
-        if (bankOwners.getOrDefault(accountId, null).equals(player.getUniqueId())) {
+        final UUID owner = bankOwners.get(accountId);
+        if (owner != null && owner.equals(player.getUniqueId())) {
             return new EconomyResponse(0, 0, EconomyResponse.ResponseType.SUCCESS, null);
         }
         return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Not owner");
@@ -256,13 +260,12 @@ public class CurrencyWithBanks extends Currency {
     }
 
     private void setOwner(@NotNull String accountId, UUID ownerUUID) {
+        bankOwners.put(accountId, ownerUUID);
         currenciesManager.getRedisManager().getConnectionPipeline(connection -> {
             connection.hset(BANK_OWNERS.toString(), accountId, ownerUUID.toString());
             return connection.publish(UPDATE_BANK_OWNER_CHANNEL_PREFIX + currencyName, RedisEconomyPlugin.getInstanceUUID().toString() + ";;" + accountId + ";;" + ownerUUID);
         }).thenAccept((result) -> {
             RedisEconomyPlugin.debug("Set owner of bank " + accountId + " to " + ownerUUID + " with result " + result);
-
-            bankOwners.put(accountId, ownerUUID);
         });
     }
 
@@ -324,7 +327,7 @@ public class CurrencyWithBanks extends Currency {
      */
     public CompletionStage<List<ScoredValue<String>>> getOrderedBankAccounts() {
         return currenciesManager.getRedisManager().getConnectionAsync(connection ->
-                connection.zrevrangeWithScores(BALANCE_PREFIX + currencyName, 0, -1));
+                connection.zrevrangeWithScores(BALANCE_BANK_PREFIX + currencyName, 0, -1));
     }
 
     /**
