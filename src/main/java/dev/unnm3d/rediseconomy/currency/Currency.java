@@ -220,7 +220,9 @@ public class Currency implements Economy {
 
     @Override
     public String format(double amount) {
-        return decimalFormat.format(amount) + (amount == 1 ? currencySingular : currencyPlural);
+        synchronized (decimalFormat) { //DecimalFormat isn't thread safe and this is called from async threads
+            return decimalFormat.format(amount) + (amount == 1 ? currencySingular : currencyPlural);
+        }
     }
 
     @Override

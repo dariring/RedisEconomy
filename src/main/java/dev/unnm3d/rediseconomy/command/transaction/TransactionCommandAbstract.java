@@ -50,11 +50,15 @@ public abstract class TransactionCommandAbstract {
 
     String convertTimeWithLocalTimeZome(long time) {
         Date date = new Date(time);
-        dateFormat.setTimeZone(TimeZone.getDefault());
-        return dateFormat.format(date);
+        synchronized (dateFormat) { //Transactions are sent from async threads
+            dateFormat.setTimeZone(TimeZone.getDefault());
+            return dateFormat.format(date);
+        }
     }
 
     Date formatDate(String fromString) throws ParseException {
-        return dateFormat.parse(fromString);
+        synchronized (dateFormat) {
+            return dateFormat.parse(fromString);
+        }
     }
 }

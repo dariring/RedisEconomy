@@ -9,6 +9,12 @@ import java.text.DecimalFormat;
 public class DecimalUtils {
 
     public static String shortAmount(double amount, DecimalFormat decimalFormat) {
+        synchronized (decimalFormat) { //The format is shared and this is called from async threads
+            return shortAmountUnsafe(amount, decimalFormat);
+        }
+    }
+
+    private static String shortAmountUnsafe(double amount, DecimalFormat decimalFormat) {
         if (amount >= 1000000000000.0) {
             return decimalFormat.format(amount / 1000000000000.0) +
                     RedisEconomyPlugin.getInstance().getConfigManager().getLangs().unitSymbols.trillion();
