@@ -8,6 +8,7 @@ import dev.unnm3d.rediseconomy.redis.RedisKeys;
 import dev.unnm3d.rediseconomy.redis.RedisManager;
 import dev.unnm3d.rediseconomy.transaction.EconomyExchange;
 import io.lettuce.core.ScoredValue;
+import io.lettuce.core.ScriptOutputType;
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection;
 import lombok.Getter;
 import net.milkbowl.vault.economy.Economy;
@@ -37,7 +38,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     @Getter
     private final RedisManager redisManager;
     private final EconomyExchange exchange;
-    private final HashMap<String, Currency> currencies;
+    private final ConcurrentHashMap<String, Currency> currencies;
     @Getter
     private final ConcurrentHashMap<String, UUID> nameUniqueIds;
     private final ConcurrentHashMap<UUID, List<UUID>> lockedAccounts;
@@ -50,7 +51,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         this.exchange = new EconomyExchange(plugin);
         this.plugin = plugin;
         this.configManager = configManager;
-        this.currencies = new HashMap<>();
+        this.currencies = new ConcurrentHashMap<>();
         try {
             this.nameUniqueIds = loadRedisNameUniqueIds().toCompletableFuture().get(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS);
             this.lockedAccounts = loadLockedAccounts().toCompletableFuture().get(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS);
@@ -80,6 +81,10 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
             if (isReload && currencySettings.getCurrencyName().equals(configManager.getSettings().defaultCurrencyName))
                 continue;
 
+            //Send the queued writes of the old currency first, so the new one loads them from Redis
+            Optional.ofNullable(currencies.get(currencySettings.getCurrencyName()))
+                    .ifPresent(Currency::terminateExecutors);
+
             Currency currency;
             if (currencySettings.isBankEnabled()) {
                 currency = new CurrencyWithBanks(this, currencySettings);
@@ -87,17 +92,8 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
                 currency = new Currency(this, currencySettings);
             }
 
-            //Replace existing currency with updated settings and terminate the old executors
-            Optional.ofNullable(currencies.put(currencySettings.getCurrencyName(), currency))
-                    .ifPresent(oldCurrency -> oldCurrency.updateExecutors.forEach(executor -> {
-                        try {
-                            if (!executor.awaitTermination(100, TimeUnit.MILLISECONDS)) {
-                                executor.shutdownNow();
-                            }
-                        } catch (InterruptedException e1) {
-                            executor.shutdownNow();
-                        }
-                    }));
+            //Replace existing currency with updated settings
+            currencies.put(currencySettings.getCurrencyName(), currency);
         }
         //Remove currencies that are not in the config anymore
         currencies.entrySet().removeIf(entry->{
@@ -181,7 +177,8 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
             removeRedisNameUniqueIds(removed);
             if (resetBalance) {
                 for (Currency currency : currencies.values()) {
-                    removed.forEach((name, uuid) -> currency.setPlayerBalance(uuid, name, 0.0));
+                    //Without the name: it would store the name-uuid just removed again
+                    removed.forEach((name, uuid) -> currency.setPlayerBalance(uuid, null, 0.0));
                 }
             }
         }
@@ -256,14 +253,12 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     @EventHandler
     private void onJoin(PlayerJoinEvent e) {
         getCurrencies().forEach(currency ->
-                currency.getAccountRedis(e.getPlayer().getUniqueId())
+                currency.refreshAccountLocal(e.getPlayer().getUniqueId(), e.getPlayer().getName())
                         .thenAccept(balance -> {
                             RedisEconomyPlugin.debug("00 Loaded " + e.getPlayer().getName() + "'s balance of " + balance + " " + currency.getCurrencyName());
 
                             if (balance == null) {
                                 currency.createPlayerAccount(e.getPlayer());
-                            } else {
-                                currency.updateAccountLocal(e.getPlayer().getUniqueId(), e.getPlayer().getName(), balance);
                             }
                         }).exceptionally(ex -> {
                             ex.printStackTrace();
@@ -345,19 +340,19 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
      * @param newCurrency The new currency to switch to
      */
     public void switchCurrency(Currency currency, Currency newCurrency) {
-        redisManager.getConnectionPipeline(asyncCommands -> {
-            asyncCommands.copy(RedisKeys.BALANCE_PREFIX + currency.getCurrencyName(),
-                            RedisKeys.BALANCE_PREFIX + currency.getCurrencyName() + "_backup")
-                    .thenAccept(success -> RedisEconomyPlugin.debug("Switch0 - Backup currency accounts: " + success));
-
-            asyncCommands.rename(RedisKeys.BALANCE_PREFIX + newCurrency.getCurrencyName(),
-                    RedisKeys.BALANCE_PREFIX + currency.getCurrencyName()).thenAccept(success ->
-                    RedisEconomyPlugin.debug("Switch1 - Overwrite new currency key with the old one: " + success));
-
-            asyncCommands.renamenx(RedisKeys.BALANCE_PREFIX + currency.getCurrencyName() + "_backup",
-                    RedisKeys.BALANCE_PREFIX + newCurrency.getCurrencyName()).thenAccept(success ->
-                    RedisEconomyPlugin.debug("Switch2 - Write the backup on the new currency key: " + success));
-            return null;
+        if (currency.getCurrencyName().equals(newCurrency.getCurrencyName())) return;
+        final String currencyKey = RedisKeys.BALANCE_PREFIX + currency.getCurrencyName();
+        //In one script: a key that doesn't exist must not leave the balances in both currencies or half swapped
+        redisManager.<Long>getConnectionAsync(asyncCommands -> asyncCommands.eval(
+                "local a=redis.call('EXISTS',KEYS[1])local b=redis.call('EXISTS',KEYS[2])" +
+                        "if a==1 then redis.call('RENAME',KEYS[1],KEYS[3])end " +
+                        "if b==1 then redis.call('RENAME',KEYS[2],KEYS[1])end " +
+                        "if a==1 then redis.call('RENAME',KEYS[3],KEYS[2])end return a+b",
+                ScriptOutputType.INTEGER,
+                new String[]{currencyKey, RedisKeys.BALANCE_PREFIX + newCurrency.getCurrencyName(), currencyKey + "_switching"}
+        )).whenComplete((swapped, throwable) -> {
+            if (throwable != null) plugin.getLogger().severe("Failed to switch currencies: " + throwable.getMessage());
+            else RedisEconomyPlugin.debug("Switch0 - Swapped currency accounts: " + swapped);
         });
     }
 
@@ -417,6 +412,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
      * @return the formatted amount
      */
     public double formatAmountString(String targetName, Currency currency, String amount) {
+        if (amount.isEmpty()) return -1;
         try {
             //Check if last char of amount is number
             if (Character.isDigit(amount.charAt(amount.length() - 1))) {
@@ -476,14 +472,19 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
                 String[] split = message.split(";;");
                 if (split.length < 3) {
                     Bukkit.getLogger().severe("Invalid message received from RedisEco channel, consider updating RedisEconomy");
+                    return;
                 }
                 //0 instanceID, 1 playerUUID, 2 playerName/maxBal, 3 balance/emtpty/empty (if applicable)
                 if (split[0].equals(RedisEconomyPlugin.getInstanceUUID().toString())) return;
                 final String[] updateArgs = Arrays.copyOfRange(split, 1, split.length);
                 for (Currency currency : getCurrencies()) {
                     String name = currency.getCurrencyName();
-                    if (channel.endsWith(name)) {
-                        currency.processUpdateMessage(channel.substring(0, channel.length() - name.length()), updateArgs);
+                    if (!channel.endsWith(name)) continue;
+                    //"dollar" also ends with "lar": the rest of the channel must be a prefix, or the update is lost
+                    final String prefix = channel.substring(0, channel.length() - name.length());
+                    if (prefix.equals(UPDATE_PLAYER_CHANNEL_PREFIX.toString()) || prefix.equals(UPDATE_MAX_BAL_PREFIX.toString())
+                            || prefix.equals(UPDATE_BANK_CHANNEL_PREFIX.toString()) || prefix.equals(UPDATE_BANK_OWNER_CHANNEL_PREFIX.toString())) {
+                        currency.processUpdateMessage(prefix, updateArgs);
                         return;
                     }
                 }
@@ -496,19 +497,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     }
 
     public void terminate() {
-        currencies.values().forEach(currency -> {
-            currency.updateExecutors.forEach(ex -> {
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        if (!ex.awaitTermination(100, TimeUnit.MILLISECONDS)) {
-                            ex.shutdownNow();
-                        }
-                    } catch (InterruptedException e1) {
-                        ex.shutdownNow();
-                    }
-                });
-            });
-        });
+        currencies.values().forEach(Currency::terminateExecutors);
         exchange.terminate();
     }
 }

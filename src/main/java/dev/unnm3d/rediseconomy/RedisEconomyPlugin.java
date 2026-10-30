@@ -167,12 +167,13 @@ public final class RedisEconomyPlugin extends JavaPlugin {
     public void onDisable() {
         if (playerListManager != null)
             playerListManager.stop();
-        if (redisManager != null)
-            redisManager.close();
         if (currenciesManager != null) {
             this.getServer().getServicesManager().unregister(Economy.class, currenciesManager.getDefaultCurrency());
             currenciesManager.terminate();
         }
+        //Only now: terminating sends the queued balance writes and transactions to Redis
+        if (redisManager != null)
+            redisManager.close();
         getLogger().info("RedisEconomy disabled successfully!");
     }
 
@@ -180,11 +181,13 @@ public final class RedisEconomyPlugin extends JavaPlugin {
      * Load the player list manager if the tabOnlinePlayers setting is enabled
      */
     public void loadPlayerList() {
-        if (configManager.getSettings().tabOnlinePlayers) {
-            this.playerListManager = new PlayerListManager(this.redisManager, this);
-        } else if (playerListManager != null) {
+        //Every reload would leave a pub/sub connection and a repeating task behind
+        if (playerListManager != null) {
             playerListManager.stop();
             playerListManager = null;
+        }
+        if (configManager.getSettings().tabOnlinePlayers) {
+            this.playerListManager = new PlayerListManager(this.redisManager, this);
         }
     }
 
@@ -213,7 +216,7 @@ public final class RedisEconomyPlugin extends JavaPlugin {
                 RedisKeys.setClusterId(configManager.getSettings().clusterId);
             return true;
         } catch (Exception e) {
-            if (e.getMessage().contains("max number of clients reached")) {
+            if (e.getMessage() != null && e.getMessage().contains("max number of clients reached")) {
                 getLogger().severe("CHECK YOUR REDIS CREDENTIALS. DO NOT USE DEFAULT CREDENTIALS OR THE PLUGIN WILL LOSE DATA AND MAY NOT WORK!");
             } else e.printStackTrace();
             return false;

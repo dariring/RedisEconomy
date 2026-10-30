@@ -14,10 +14,13 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class EconomyExchange {
+
+    private static final String REVERT_IN_PROGRESS = "-1";
 
     private final RedisEconomyPlugin plugin;
     private final ExecutorService executorService;
@@ -43,30 +46,30 @@ public class EconomyExchange {
      * @return Map of transaction ids and transactions
      */
     public CompletionStage<TreeMap<Long, Transaction>> getTransactions(AccountID accountId, int limit) {
-        return CompletableFuture.supplyAsync(() ->
-                        plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
-                                connection.hgetall(RedisKeys.TRANSACTIONS + accountId.toString())
-                        ), executorService)
-                .thenApply(transactions -> {
-                    if (transactions == null || transactions.isEmpty()) {
-                        return new TreeMap<Long, Transaction>();
-                    }
-
-                    final TreeMap<Long, Transaction> transactionsMap = new TreeMap<>();
-                    transactions.entrySet().stream().toList().stream()
-                            .sorted(Comparator.<Map.Entry<String, String>>comparingLong(entry ->
-                                    Long.parseLong(entry.getKey())).reversed())
-                            .limit(limit)
-                            .forEach(entry -> transactionsMap.put(
-                                    Long.parseLong(entry.getKey()),
-                                    Transaction.fromString(entry.getValue())
-                            ));
-                    return transactionsMap;
-                })
+        return CompletableFuture.supplyAsync(() -> readTransactions(accountId, limit), executorService)
                 .exceptionally(exc -> {
                     exc.printStackTrace();
                     return new TreeMap<>(); // Return empty map instead of null for better error handling
                 });
+    }
+
+    private TreeMap<Long, Transaction> readTransactions(AccountID accountId, int limit) {
+        final Map<String, String> transactions = plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
+                connection.hgetall(RedisKeys.TRANSACTIONS + accountId.toString()));
+        if (transactions == null || transactions.isEmpty()) {
+            return new TreeMap<>();
+        }
+
+        final TreeMap<Long, Transaction> transactionsMap = new TreeMap<>();
+        transactions.entrySet().stream().toList().stream()
+                .sorted(Comparator.<Map.Entry<String, String>>comparingLong(entry ->
+                        Long.parseLong(entry.getKey())).reversed())
+                .limit(limit)
+                .forEach(entry -> transactionsMap.put(
+                        Long.parseLong(entry.getKey()),
+                        Transaction.fromString(entry.getValue())
+                ));
+        return transactionsMap;
     }
 
     public int getCurrentTransactionID() {
@@ -109,8 +112,9 @@ public class EconomyExchange {
      */
     public CompletionStage<Transaction> getTransaction(@NotNull AccountID accountId, long id) {
         return CompletableFuture.supplyAsync(() -> {
-            return Transaction.fromString(plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
-                    connection.hget(RedisKeys.TRANSACTIONS + accountId.toString(), String.valueOf(id))));
+            final String serialized = plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
+                    connection.hget(RedisKeys.TRANSACTIONS + accountId.toString(), String.valueOf(id)));
+            return serialized == null ? null : Transaction.fromString(serialized);
         }, executorService).orTimeout(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS).exceptionally(exc -> {
             exc.printStackTrace();
             return null;
@@ -146,10 +150,7 @@ public class EconomyExchange {
                             null, reason + stackTrace
                     ));
 
-                    plugin.getScheduler().runTask(() -> {
-                        plugin.getServer().getPluginManager().callEvent(transactionSenderEvent);
-                        plugin.getServer().getPluginManager().callEvent(transactionReceiverEvent);
-                    });
+                    callEvents(transactionSenderEvent, transactionReceiverEvent);
 
                     //noinspection unchecked
                     return plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
@@ -199,7 +200,7 @@ public class EconomyExchange {
                             target, currency.getCurrencyName(), System.currentTimeMillis(),
                             //If target is null, it has been sent from the server
                             amount, null, reason + stackTrace));
-                    plugin.getScheduler().runTask(() -> plugin.getServer().getPluginManager().callEvent(transactionEvent));
+                    callEvents(transactionEvent);
                     return (Long) plugin.getCurrenciesManager().getRedisManager().getConnectionSync(commands -> commands.eval(
                             "local a=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])if tonumber(ARGV[2])>0 then redis.call('hexpire',KEYS[2],ARGV[2],'FIELDS',1,a)end;return a",
                             ScriptOutputType.INTEGER,
@@ -249,10 +250,23 @@ public class EconomyExchange {
                         return CompletableFuture.completedFuture(Long.valueOf(transaction.getRevertedWith()));
                     }
 
+                    // Claim the transaction, so that a concurrent revert can't apply it twice
+                    final String unrevertedTransaction = transaction.toString();
+                    transaction.setRevertedWith(REVERT_IN_PROGRESS);
+                    final String claimedTransaction = transaction.toString();
+                    final Long claimed = plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection -> connection.eval(
+                            "if redis.call('HGET',KEYS[1],ARGV[1])==ARGV[2] then redis.call('HSET',KEYS[1],ARGV[1],ARGV[3]) return 1 end return 0",
+                            ScriptOutputType.INTEGER,
+                            new String[]{RedisKeys.TRANSACTIONS + accountOwner.toString()},
+                            String.valueOf(transactionId), unrevertedTransaction, claimedTransaction));
+                    if (claimed == null || claimed != 1) {
+                        RedisEconomyPlugin.debug("revert01b Transaction " + transactionId + " is being reverted by someone else");
+                        return CompletableFuture.completedFuture((long) -1);
+                    }
+
                     // Fire event asynchronously (non-blocking)
                     final TransactionEvent revertTransactionEvent = new TransactionEvent(transaction);
-                    plugin.getScheduler().runTask(() ->
-                            plugin.getServer().getPluginManager().callEvent(revertTransactionEvent));
+                    callEvents(revertTransactionEvent);
 
                     // Proceed with revert operation
                     return currency.revertTransaction(transactionId, revertTransactionEvent.getTransaction())
@@ -304,8 +318,10 @@ public class EconomyExchange {
         return CompletableFuture.supplyAsync(() -> {
             int totalAccounts = plugin.getCurrenciesManager().getNameUniqueIds().size();
             int archivedCount = 0;
+            //What reached the file, the only transactions that can be removed from Redis
+            final Map<AccountID, String[]> archived = new HashMap<>();
 
-            try (BufferedWriter writer = Files.newBufferedWriter(archivePath, StandardCharsets.UTF_8)) {
+            try (BufferedWriter writer = Files.newBufferedWriter(archivePath, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
                 for (Map.Entry<String, UUID> entry : plugin.getCurrenciesManager().getNameUniqueIds().entrySet()) {
 
                     String username = entry.getKey();
@@ -313,11 +329,8 @@ public class EconomyExchange {
 
                     try {
                         AccountID accountID = new AccountID(uuid);
-                        final Map<Long, Transaction> transactionsMap = plugin.getCurrenciesManager()
-                                .getExchange()
-                                .getTransactions(accountID, Integer.MAX_VALUE)
-                                .toCompletableFuture()
-                                .join(); // Using join() is better in this context than get()
+                        // Read directly: getTransactions turns a Redis error into an empty result
+                        final Map<Long, Transaction> transactionsMap = readTransactions(accountID, Integer.MAX_VALUE);
 
                         if (transactionsMap.isEmpty()) {
                             continue;
@@ -337,6 +350,7 @@ public class EconomyExchange {
 
                         // Add separator between accounts
                         writer.newLine();
+                        archived.put(accountID, transactionsMap.keySet().stream().map(String::valueOf).toArray(String[]::new));
 
                         // Report progress at regular intervals
                         archivedCount++;
@@ -352,23 +366,19 @@ public class EconomyExchange {
                 }
             } catch (IOException e) {
                 plugin.getLogger().severe("Failed to write transaction archive: " + e.getMessage());
+                return 0;
             }
 
+            // Remove only what has been written and closed successfully: accounts without a known name
+            // (banks too) and accounts that failed are not in the file, and new transactions may have arrived
+            archived.forEach((accountID, ids) -> plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
+                    connection.hdel(RedisKeys.TRANSACTIONS + accountID.toString(), ids)));
+            final int removedAccounts = archived.size();
+            plugin.getScheduler().runTask(() ->
+                    plugin.langs().send(sender, plugin.langs().transactionsArchiveCompleted
+                            .replace("%size%", String.valueOf(removedAccounts))
+                            .replace("%file%", archivePath.getFileName().toString())));
             return archivedCount;
-        }).thenCompose(archivedCount -> {
-            if (archivedCount <= 0) {
-                return CompletableFuture.completedStage(archivedCount);
-            }
-
-            // Remove transactions only if archiving was successful
-            return plugin.getCurrenciesManager().getExchange().removeAllTransactions()
-                    .thenApply(deletedCount -> {
-                        plugin.getScheduler().runTask(() ->
-                                plugin.langs().send(sender, plugin.langs().transactionsArchiveCompleted
-                                        .replace("%size%", String.valueOf(deletedCount))
-                                        .replace("%file%", archivePath.getFileName().toString())));
-                        return archivedCount;
-                    });
         });
     }
     
@@ -407,13 +417,26 @@ public class EconomyExchange {
     }
 
     public void terminate() {
+        executorService.shutdown();
         try {
-            if (!executorService.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+            if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
                 executorService.shutdownNow();
             }
         } catch (InterruptedException e) {
             executorService.shutdownNow();
         }
+    }
+
+    /**
+     * Fire a transaction event on the main thread. The scheduler refuses tasks while the plugin is disabling
+     */
+    private void callEvents(TransactionEvent... events) {
+        if (!plugin.isEnabled()) return;
+        plugin.getScheduler().runTask(() -> {
+            for (TransactionEvent event : events) {
+                plugin.getServer().getPluginManager().callEvent(event);
+            }
+        });
     }
 
 }

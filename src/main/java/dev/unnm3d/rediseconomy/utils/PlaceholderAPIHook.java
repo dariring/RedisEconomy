@@ -60,9 +60,10 @@ public class PlaceholderAPIHook extends PlaceholderExpansion implements Relation
                     //Extract data from vault and cache
                     String worldName = plugin.getServer().getWorlds().get(0).getName();
                     UUID fromString = UUID.fromString(accounts.get(i).getValue());
+                    //Vault has no chat provider without a permission/chat plugin
                     baltopList.add(new String[]{
-                            prefixProvider.getProvider().getPlayerPrefix(worldName, plugin.getServer().getOfflinePlayer(fromString)),
-                            prefixProvider.getProvider().getPlayerSuffix(worldName, plugin.getServer().getOfflinePlayer(fromString)),
+                            prefixProvider == null ? "" : prefixProvider.getProvider().getPlayerPrefix(worldName, plugin.getServer().getOfflinePlayer(fromString)),
+                            prefixProvider == null ? "" : prefixProvider.getProvider().getPlayerSuffix(worldName, plugin.getServer().getOfflinePlayer(fromString)),
                             currenciesManager.getUsernameFromUUIDCache(fromString) == null ? "Unknown" : currenciesManager.getUsernameFromUUIDCache(fromString),
                             String.valueOf(accounts.get(i).getScore())
                     });
@@ -109,6 +110,7 @@ public class PlaceholderAPIHook extends PlaceholderExpansion implements Relation
         if (currency == null) return "Invalid currency";
 
         if (splitted.getFirst().equals("bal")) {
+            if (player == null) return null; //Placeholders parsed without a player
             double balance = currency.getBalance(player);
             return parseParams(balance, splitted, currency);
 
@@ -125,9 +127,11 @@ public class PlaceholderAPIHook extends PlaceholderExpansion implements Relation
 
         switch (splitted.getFirst()) {
             case "totsupply" -> {
-                return parseParams(totalSupplyCache.get(currency), splitted, currency);
+                //The cache is keyed by currency, which a reload replaces
+                return parseParams(totalSupplyCache.getOrDefault(currency, 0.0D), splitted, currency);
             }
             case "maxbal" -> {
+                if (player == null) return null;
                 return String.valueOf(currency.getPlayerMaxBalance(player.getUniqueId()));
             }
             case "top" -> {
@@ -138,6 +142,7 @@ public class PlaceholderAPIHook extends PlaceholderExpansion implements Relation
                 if (user_balance_strings == null) return null;
 
                 if (splitted.get(1).equals("position")) {//rediseco_top_position_<currency>
+                    if (player == null) return null;
                     for (int i = 0; i < user_balance_strings.size(); i++) {
                         if (user_balance_strings.get(i)[2].equals(player.getName())) {
                             return String.valueOf(i + 1);
