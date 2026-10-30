@@ -35,7 +35,8 @@ public class BackupRestoreCommand implements CommandExecutor, TabCompleter {
         }
         CompletableFuture.runAsync(() -> {
             Path userPath = Path.of(plugin.getDataFolder().getAbsolutePath(), args[0]);
-            switch (label) {
+            //The label is "rediseconomy:backup-economy" when typed with the namespace
+            switch (label.substring(label.indexOf(':') + 1)) {
                 case "backup-economy" -> {
                     try (FileWriter fw = new FileWriter(userPath.normalize().toFile())) {
                         StringBuilder sb = new StringBuilder();
