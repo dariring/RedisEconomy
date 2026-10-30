@@ -56,7 +56,15 @@ public class Currency implements Economy {
      * Lock it to make a balance check and the following write one atomic step
      */
     protected final BalanceLedger<UUID> playerLedger;
-    private final AtomicLong lastWriteId = new AtomicLong();
+    /**
+     * Shared by all currencies and never reset: a reload replaces the Currency objects but keeps the instance id,
+     * and Redis ignores a write id lower than the last one it applied for that instance and executor.
+     */
+    private static final AtomicLong LAST_WRITE_ID = new AtomicLong();
+    /**
+     * Stands for the executor index of writes that arrive after the executors were shut down
+     */
+    private static final int LATE_WRITES_INDEX = -1;
     private volatile boolean terminated = false;
     private static final long TERMINATION_TIMEOUT_MILLIS = 10_000;
 
@@ -83,7 +91,7 @@ public class Currency implements Economy {
             local b=redis.call('ZSCORE',KEYS[1],ARGV[1])
             if ARGV[8]~='' then redis.call('HSET',KEYS[2],ARGV[8],ARGV[1]) end
             if redis.call('EXISTS',KEYS[3])==0 then
-              redis.call('SET',KEYS[3],redis.call('TIME')[1]*1000)
+              redis.call('SET',KEYS[3],redis.call('TIME')[1]..'000')
             end
             redis.call('INCR',KEYS[3])
             local s=redis.call('GET',KEYS[3])
@@ -697,8 +705,16 @@ public class Currency implements Economy {
      */
     protected <K> void enqueueBalanceWrite(@NotNull BalanceWrite<K> write, int identifier) {
         final int executorIndex = Math.floorMod(identifier, updateExecutors.size());
-        final long writeId = lastWriteId.incrementAndGet();
-        runOnExecutor(executorIndex, () -> writeUntilCommitted(write, writeId, executorIndex));
+        try {
+            //The id is taken when the write starts: player and bank writes share the executors but not a lock,
+            //so ids taken before queueing could reach the executor out of order and the lower one would be ignored
+            updateExecutors.get(executorIndex).execute(() -> writeUntilCommitted(write, LAST_WRITE_ID.incrementAndGet(), executorIndex));
+        } catch (RejectedExecutionException e) {
+            //The currency has been replaced or the plugin is disabling: don't lose the write
+            synchronized (LAST_WRITE_ID) {
+                writeUntilCommitted(write, LAST_WRITE_ID.incrementAndGet(), LATE_WRITES_INDEX);
+            }
+        }
     }
 
     /**
