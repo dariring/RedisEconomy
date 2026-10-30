@@ -38,7 +38,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     @Getter
     private final RedisManager redisManager;
     private final EconomyExchange exchange;
-    private final HashMap<String, Currency> currencies;
+    private final ConcurrentHashMap<String, Currency> currencies;
     @Getter
     private final ConcurrentHashMap<String, UUID> nameUniqueIds;
     private final ConcurrentHashMap<UUID, List<UUID>> lockedAccounts;
@@ -51,7 +51,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         this.exchange = new EconomyExchange(plugin);
         this.plugin = plugin;
         this.configManager = configManager;
-        this.currencies = new HashMap<>();
+        this.currencies = new ConcurrentHashMap<>();
         try {
             this.nameUniqueIds = loadRedisNameUniqueIds().toCompletableFuture().get(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS);
             this.lockedAccounts = loadLockedAccounts().toCompletableFuture().get(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS);
@@ -472,14 +472,19 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
                 String[] split = message.split(";;");
                 if (split.length < 3) {
                     Bukkit.getLogger().severe("Invalid message received from RedisEco channel, consider updating RedisEconomy");
+                    return;
                 }
                 //0 instanceID, 1 playerUUID, 2 playerName/maxBal, 3 balance/emtpty/empty (if applicable)
                 if (split[0].equals(RedisEconomyPlugin.getInstanceUUID().toString())) return;
                 final String[] updateArgs = Arrays.copyOfRange(split, 1, split.length);
                 for (Currency currency : getCurrencies()) {
                     String name = currency.getCurrencyName();
-                    if (channel.endsWith(name)) {
-                        currency.processUpdateMessage(channel.substring(0, channel.length() - name.length()), updateArgs);
+                    if (!channel.endsWith(name)) continue;
+                    //"dollar" also ends with "lar": the rest of the channel must be a prefix, or the update is lost
+                    final String prefix = channel.substring(0, channel.length() - name.length());
+                    if (prefix.equals(UPDATE_PLAYER_CHANNEL_PREFIX.toString()) || prefix.equals(UPDATE_MAX_BAL_PREFIX.toString())
+                            || prefix.equals(UPDATE_BANK_CHANNEL_PREFIX.toString()) || prefix.equals(UPDATE_BANK_OWNER_CHANNEL_PREFIX.toString())) {
+                        currency.processUpdateMessage(prefix, updateArgs);
                         return;
                     }
                 }
