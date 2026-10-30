@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -45,30 +46,30 @@ public class EconomyExchange {
      * @return Map of transaction ids and transactions
      */
     public CompletionStage<TreeMap<Long, Transaction>> getTransactions(AccountID accountId, int limit) {
-        return CompletableFuture.supplyAsync(() ->
-                        plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
-                                connection.hgetall(RedisKeys.TRANSACTIONS + accountId.toString())
-                        ), executorService)
-                .thenApply(transactions -> {
-                    if (transactions == null || transactions.isEmpty()) {
-                        return new TreeMap<Long, Transaction>();
-                    }
-
-                    final TreeMap<Long, Transaction> transactionsMap = new TreeMap<>();
-                    transactions.entrySet().stream().toList().stream()
-                            .sorted(Comparator.<Map.Entry<String, String>>comparingLong(entry ->
-                                    Long.parseLong(entry.getKey())).reversed())
-                            .limit(limit)
-                            .forEach(entry -> transactionsMap.put(
-                                    Long.parseLong(entry.getKey()),
-                                    Transaction.fromString(entry.getValue())
-                            ));
-                    return transactionsMap;
-                })
+        return CompletableFuture.supplyAsync(() -> readTransactions(accountId, limit), executorService)
                 .exceptionally(exc -> {
                     exc.printStackTrace();
                     return new TreeMap<>(); // Return empty map instead of null for better error handling
                 });
+    }
+
+    private TreeMap<Long, Transaction> readTransactions(AccountID accountId, int limit) {
+        final Map<String, String> transactions = plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
+                connection.hgetall(RedisKeys.TRANSACTIONS + accountId.toString()));
+        if (transactions == null || transactions.isEmpty()) {
+            return new TreeMap<>();
+        }
+
+        final TreeMap<Long, Transaction> transactionsMap = new TreeMap<>();
+        transactions.entrySet().stream().toList().stream()
+                .sorted(Comparator.<Map.Entry<String, String>>comparingLong(entry ->
+                        Long.parseLong(entry.getKey())).reversed())
+                .limit(limit)
+                .forEach(entry -> transactionsMap.put(
+                        Long.parseLong(entry.getKey()),
+                        Transaction.fromString(entry.getValue())
+                ));
+        return transactionsMap;
     }
 
     public int getCurrentTransactionID() {
@@ -317,8 +318,10 @@ public class EconomyExchange {
         return CompletableFuture.supplyAsync(() -> {
             int totalAccounts = plugin.getCurrenciesManager().getNameUniqueIds().size();
             int archivedCount = 0;
+            //What reached the file, the only transactions that can be removed from Redis
+            final Map<AccountID, String[]> archived = new HashMap<>();
 
-            try (BufferedWriter writer = Files.newBufferedWriter(archivePath, StandardCharsets.UTF_8)) {
+            try (BufferedWriter writer = Files.newBufferedWriter(archivePath, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
                 for (Map.Entry<String, UUID> entry : plugin.getCurrenciesManager().getNameUniqueIds().entrySet()) {
 
                     String username = entry.getKey();
@@ -326,11 +329,8 @@ public class EconomyExchange {
 
                     try {
                         AccountID accountID = new AccountID(uuid);
-                        final Map<Long, Transaction> transactionsMap = plugin.getCurrenciesManager()
-                                .getExchange()
-                                .getTransactions(accountID, Integer.MAX_VALUE)
-                                .toCompletableFuture()
-                                .join(); // Using join() is better in this context than get()
+                        // Read directly: getTransactions turns a Redis error into an empty result
+                        final Map<Long, Transaction> transactionsMap = readTransactions(accountID, Integer.MAX_VALUE);
 
                         if (transactionsMap.isEmpty()) {
                             continue;
@@ -350,6 +350,7 @@ public class EconomyExchange {
 
                         // Add separator between accounts
                         writer.newLine();
+                        archived.put(accountID, transactionsMap.keySet().stream().map(String::valueOf).toArray(String[]::new));
 
                         // Report progress at regular intervals
                         archivedCount++;
@@ -365,23 +366,19 @@ public class EconomyExchange {
                 }
             } catch (IOException e) {
                 plugin.getLogger().severe("Failed to write transaction archive: " + e.getMessage());
+                return 0;
             }
 
+            // Remove only what has been written and closed successfully: accounts without a known name
+            // (banks too) and accounts that failed are not in the file, and new transactions may have arrived
+            archived.forEach((accountID, ids) -> plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
+                    connection.hdel(RedisKeys.TRANSACTIONS + accountID.toString(), ids)));
+            final int removedAccounts = archived.size();
+            plugin.getScheduler().runTask(() ->
+                    plugin.langs().send(sender, plugin.langs().transactionsArchiveCompleted
+                            .replace("%size%", String.valueOf(removedAccounts))
+                            .replace("%file%", archivePath.getFileName().toString())));
             return archivedCount;
-        }).thenCompose(archivedCount -> {
-            if (archivedCount <= 0) {
-                return CompletableFuture.completedStage(archivedCount);
-            }
-
-            // Remove transactions only if archiving was successful
-            return plugin.getCurrenciesManager().getExchange().removeAllTransactions()
-                    .thenApply(deletedCount -> {
-                        plugin.getScheduler().runTask(() ->
-                                plugin.langs().send(sender, plugin.langs().transactionsArchiveCompleted
-                                        .replace("%size%", String.valueOf(deletedCount))
-                                        .replace("%file%", archivePath.getFileName().toString())));
-                        return archivedCount;
-                    });
         });
     }
     
