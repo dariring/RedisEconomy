@@ -80,6 +80,10 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
             if (isReload && currencySettings.getCurrencyName().equals(configManager.getSettings().defaultCurrencyName))
                 continue;
 
+            //Send the queued writes of the old currency first, so the new one loads them from Redis
+            Optional.ofNullable(currencies.get(currencySettings.getCurrencyName()))
+                    .ifPresent(Currency::terminateExecutors);
+
             Currency currency;
             if (currencySettings.isBankEnabled()) {
                 currency = new CurrencyWithBanks(this, currencySettings);
@@ -87,17 +91,8 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
                 currency = new Currency(this, currencySettings);
             }
 
-            //Replace existing currency with updated settings and terminate the old executors
-            Optional.ofNullable(currencies.put(currencySettings.getCurrencyName(), currency))
-                    .ifPresent(oldCurrency -> oldCurrency.updateExecutors.forEach(executor -> {
-                        try {
-                            if (!executor.awaitTermination(100, TimeUnit.MILLISECONDS)) {
-                                executor.shutdownNow();
-                            }
-                        } catch (InterruptedException e1) {
-                            executor.shutdownNow();
-                        }
-                    }));
+            //Replace existing currency with updated settings
+            currencies.put(currencySettings.getCurrencyName(), currency);
         }
         //Remove currencies that are not in the config anymore
         currencies.entrySet().removeIf(entry->{
@@ -494,19 +489,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     }
 
     public void terminate() {
-        currencies.values().forEach(currency -> {
-            currency.updateExecutors.forEach(ex -> {
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        if (!ex.awaitTermination(100, TimeUnit.MILLISECONDS)) {
-                            ex.shutdownNow();
-                        }
-                    } catch (InterruptedException e1) {
-                        ex.shutdownNow();
-                    }
-                });
-            });
-        });
+        currencies.values().forEach(Currency::terminateExecutors);
         exchange.terminate();
     }
 }

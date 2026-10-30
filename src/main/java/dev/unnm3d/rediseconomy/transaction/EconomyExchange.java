@@ -146,10 +146,7 @@ public class EconomyExchange {
                             null, reason + stackTrace
                     ));
 
-                    plugin.getScheduler().runTask(() -> {
-                        plugin.getServer().getPluginManager().callEvent(transactionSenderEvent);
-                        plugin.getServer().getPluginManager().callEvent(transactionReceiverEvent);
-                    });
+                    callEvents(transactionSenderEvent, transactionReceiverEvent);
 
                     //noinspection unchecked
                     return plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
@@ -199,7 +196,7 @@ public class EconomyExchange {
                             target, currency.getCurrencyName(), System.currentTimeMillis(),
                             //If target is null, it has been sent from the server
                             amount, null, reason + stackTrace));
-                    plugin.getScheduler().runTask(() -> plugin.getServer().getPluginManager().callEvent(transactionEvent));
+                    callEvents(transactionEvent);
                     return (Long) plugin.getCurrenciesManager().getRedisManager().getConnectionSync(commands -> commands.eval(
                             "local a=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])if tonumber(ARGV[2])>0 then redis.call('hexpire',KEYS[2],ARGV[2],'FIELDS',1,a)end;return a",
                             ScriptOutputType.INTEGER,
@@ -251,8 +248,7 @@ public class EconomyExchange {
 
                     // Fire event asynchronously (non-blocking)
                     final TransactionEvent revertTransactionEvent = new TransactionEvent(transaction);
-                    plugin.getScheduler().runTask(() ->
-                            plugin.getServer().getPluginManager().callEvent(revertTransactionEvent));
+                    callEvents(revertTransactionEvent);
 
                     // Proceed with revert operation
                     return currency.revertTransaction(transactionId, revertTransactionEvent.getTransaction())
@@ -407,13 +403,26 @@ public class EconomyExchange {
     }
 
     public void terminate() {
+        executorService.shutdown();
         try {
-            if (!executorService.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+            if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
                 executorService.shutdownNow();
             }
         } catch (InterruptedException e) {
             executorService.shutdownNow();
         }
+    }
+
+    /**
+     * Fire a transaction event on the main thread. The scheduler refuses tasks while the plugin is disabling
+     */
+    private void callEvents(TransactionEvent... events) {
+        if (!plugin.isEnabled()) return;
+        plugin.getScheduler().runTask(() -> {
+            for (TransactionEvent event : events) {
+                plugin.getServer().getPluginManager().callEvent(event);
+            }
+        });
     }
 
 }

@@ -167,12 +167,13 @@ public final class RedisEconomyPlugin extends JavaPlugin {
     public void onDisable() {
         if (playerListManager != null)
             playerListManager.stop();
-        if (redisManager != null)
-            redisManager.close();
         if (currenciesManager != null) {
             this.getServer().getServicesManager().unregister(Economy.class, currenciesManager.getDefaultCurrency());
             currenciesManager.terminate();
         }
+        //Only now: terminating sends the queued balance writes and transactions to Redis
+        if (redisManager != null)
+            redisManager.close();
         getLogger().info("RedisEconomy disabled successfully!");
     }
 

@@ -58,6 +58,7 @@ public class Currency implements Economy {
     protected final BalanceLedger<UUID> playerLedger;
     private final AtomicLong lastWriteId = new AtomicLong();
     private volatile boolean terminated = false;
+    private static final long TERMINATION_TIMEOUT_MILLIS = 10_000;
 
     /**
      * Commits a balance write and publishes the result. Being a script, nothing can run in between.
@@ -853,18 +854,26 @@ public class Currency implements Economy {
     }
 
     /**
-     * Terminate all executors
+     * Terminate all executors, after the queued balance writes have been sent to Redis
      */
     public void terminateExecutors() {
-        updateExecutors.forEach(executor -> {
-            try {
-                if (!executor.awaitTermination(100, TimeUnit.MILLISECONDS)) {
-                    executor.shutdownNow();
-                }
-            } catch (InterruptedException e1) {
-                executor.shutdownNow();
+        updateExecutors.forEach(ExecutorService::shutdown);
+        final long deadline = System.currentTimeMillis() + TERMINATION_TIMEOUT_MILLIS;
+        try {
+            for (ExecutorService executor : updateExecutors) {
+                executor.awaitTermination(Math.max(0, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
             }
-        });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        terminated = true;
+        int notStarted = 0;
+        for (ExecutorService executor : updateExecutors) {
+            notStarted += executor.shutdownNow().size();
+        }
+        if (notStarted > 0) {
+            RedisEconomyPlugin.getInstance().getLogger().severe("LOST " + notStarted + " balance writes of currency " + currencyName + ": Redis did not answer before the timeout");
+        }
     }
 
 }
