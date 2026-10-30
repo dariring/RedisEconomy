@@ -19,6 +19,8 @@ import java.util.concurrent.*;
 
 public class EconomyExchange {
 
+    private static final String REVERT_IN_PROGRESS = "-1";
+
     private final RedisEconomyPlugin plugin;
     private final ExecutorService executorService;
     private long updateTIDTimestamp = System.currentTimeMillis();
@@ -109,8 +111,9 @@ public class EconomyExchange {
      */
     public CompletionStage<Transaction> getTransaction(@NotNull AccountID accountId, long id) {
         return CompletableFuture.supplyAsync(() -> {
-            return Transaction.fromString(plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
-                    connection.hget(RedisKeys.TRANSACTIONS + accountId.toString(), String.valueOf(id))));
+            final String serialized = plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
+                    connection.hget(RedisKeys.TRANSACTIONS + accountId.toString(), String.valueOf(id)));
+            return serialized == null ? null : Transaction.fromString(serialized);
         }, executorService).orTimeout(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS).exceptionally(exc -> {
             exc.printStackTrace();
             return null;
@@ -244,6 +247,20 @@ public class EconomyExchange {
                         RedisEconomyPlugin.debug("revert01b Transaction " + transactionId +
                                 " already reverted with " + transaction.getRevertedWith());
                         return CompletableFuture.completedFuture(Long.valueOf(transaction.getRevertedWith()));
+                    }
+
+                    // Claim the transaction, so that a concurrent revert can't apply it twice
+                    final String unrevertedTransaction = transaction.toString();
+                    transaction.setRevertedWith(REVERT_IN_PROGRESS);
+                    final String claimedTransaction = transaction.toString();
+                    final Long claimed = plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection -> connection.eval(
+                            "if redis.call('HGET',KEYS[1],ARGV[1])==ARGV[2] then redis.call('HSET',KEYS[1],ARGV[1],ARGV[3]) return 1 end return 0",
+                            ScriptOutputType.INTEGER,
+                            new String[]{RedisKeys.TRANSACTIONS + accountOwner.toString()},
+                            String.valueOf(transactionId), unrevertedTransaction, claimedTransaction));
+                    if (claimed == null || claimed != 1) {
+                        RedisEconomyPlugin.debug("revert01b Transaction " + transactionId + " is being reverted by someone else");
+                        return CompletableFuture.completedFuture((long) -1);
                     }
 
                     // Fire event asynchronously (non-blocking)
