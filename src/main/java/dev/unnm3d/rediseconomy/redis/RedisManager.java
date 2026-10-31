@@ -148,6 +148,26 @@ public class RedisManager {
         return System.currentTimeMillis() >= debitsRefusedUntil && roundRobinConnectionPool.anyOpen();
     }
 
+    /**
+     * Runs the task off the main thread, again and again until the plugin stops
+     */
+    public void scheduleRepeating(Runnable task, long periodMillis) {
+        executorService.scheduleWithFixedDelay(() -> {
+            try {
+                task.run();
+            } catch (RuntimeException e) { //An exception would cancel the next runs
+                RedisEconomyPlugin.getInstance().getLogger().warning("Periodic Redis check failed: " + e);
+            }
+        }, periodMillis, periodMillis, TimeUnit.MILLISECONDS);
+    }
+
+    public void scheduleOnce(Runnable task, long delayMillis) {
+        try {
+            executorService.schedule(task, delayMillis, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) { //Shutting down
+        }
+    }
+
     public void debitNotAnswered() {
         debitsRefusedUntil = System.currentTimeMillis() + DEBIT_BACKOFF_MILLIS;
     }

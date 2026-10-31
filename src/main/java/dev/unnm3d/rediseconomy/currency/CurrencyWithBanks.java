@@ -40,15 +40,15 @@ public class CurrencyWithBanks extends Currency {
         bankAccounts = new ConcurrentHashMap<>();
         bankLedger = new BalanceLedger<>(bankAccounts);
         bankOwners = new ConcurrentHashMap<>();
-        getOrderedBankAccounts().thenApply(list -> {
-            for (ScoredValue<String> scoredValue : list) {
-                bankAccounts.put(scoredValue.getValue(), scoredValue.getScore());
-            }
+        try {
+            final BalancesSnapshot banks = readBalances(BALANCE_BANK_PREFIX + currencyName);
+            banks.balances().forEach((accountId, balance) -> bankLedger.update(accountId, balance, banks.sequence()));
             if (!bankAccounts.isEmpty()) {
                 RedisEconomyPlugin.debug("start1bank Loaded " + bankAccounts.size() + " accounts for currency " + currencyName);
             }
-            return list;
-        }).toCompletableFuture().join();
+        } catch (ExecutionException | InterruptedException | TimeoutException e) {
+            throw new RuntimeException("Can't load the bank accounts of currency " + currencyName, e);
+        }
         getRedisBankOwners().thenApply(map -> {
             map.forEach((k, v) -> bankOwners.put(k, UUID.fromString(v)));
             if (!bankOwners.isEmpty()) {
@@ -74,6 +74,7 @@ public class CurrencyWithBanks extends Currency {
                 RedisEconomyPlugin.debug("01c Received bank deletion " + accountId);
                 return;
             }
+            if (arguments.length > 3 && !currenciesManager.acceptsDataEpoch(arguments[3])) return;
             double balance = Double.parseDouble(arguments[1]);
             bankLedger.update(accountId, balance, arguments.length > 2 ? Long.parseLong(arguments[2]) : BalanceLedger.UNSEQUENCED);
             RedisEconomyPlugin.debug("01c Received bank balance update " + accountId + " to " + balance);
@@ -325,7 +326,7 @@ public class CurrencyWithBanks extends Currency {
                 BALANCE_BANK_PREFIX + currencyName,
                 UPDATE_BANK_CHANNEL_PREFIX + currencyName,
                 RedisEconomyPlugin.getInstanceUUID() + ";;" + accountId + ";;",
-                "", mode, value, seed
+                "", mode, value, seed, bankLedger.sequenceOf(accountId)
         );
     }
 
@@ -344,9 +345,14 @@ public class CurrencyWithBanks extends Currency {
     }
 
     @Override
+    public long highestSeenSequence() {
+        return Math.max(super.highestSeenSequence(), bankLedger.highestSequence());
+    }
+
+    @Override
     public void reseedAfterDataLoss() throws ExecutionException, InterruptedException, TimeoutException {
         super.reseedAfterDataLoss();
-        reseedBalances(BALANCE_BANK_PREFIX + currencyName, new HashMap<>(bankAccounts));
+        reseedBalances(BALANCE_BANK_PREFIX + currencyName, bankLedger.committedBalances());
         if (bankOwners.isEmpty()) return;
         final Map<String, String> owners = new HashMap<>();
         bankOwners.forEach((accountId, owner) -> owners.put(accountId, owner.toString()));
