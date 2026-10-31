@@ -3,6 +3,7 @@ package dev.unnm3d.rediseconomy.currency;
 import dev.unnm3d.rediseconomy.RedisEconomyPlugin;
 import dev.unnm3d.rediseconomy.config.CurrencySettings;
 import dev.unnm3d.rediseconomy.redis.RedisKeys;
+import dev.unnm3d.rediseconomy.redis.RedisManager;
 import dev.unnm3d.rediseconomy.transaction.AccountID;
 import dev.unnm3d.rediseconomy.transaction.Transaction;
 import io.lettuce.core.ScoredValue;
@@ -98,6 +99,70 @@ public class Currency implements Economy {
             redis.call('PUBLISH',ARGV[6],ARGV[7]..b..';;'..s)
             redis.call('SET',KEYS[4],ARGV[5],'EX',86400)
             return {b,s}""";
+
+    /**
+     * Commits a withdraw only if Redis holds the funds: another server may have spent them a moment ago.
+     * KEYS: same as the balance write script
+     * ARGV: account, unused, amount, balance if the account is not on Redis, write id, channel, message prefix, name
+     * Returns O(k), I(nsufficient funds) or F(enced, see the next script), the balance and the sequence
+     */
+    private static final String DEBIT_SCRIPT = """
+            if tonumber(redis.call('GET',KEYS[4]) or '0')>=tonumber(ARGV[5]) then
+              return {'F',redis.call('ZSCORE',KEYS[1],ARGV[1]) or '0',redis.call('GET',KEYS[3]) or '0'}
+            end
+            redis.call('ZADD',KEYS[1],'NX',ARGV[4],ARGV[1])
+            if tonumber(redis.call('ZSCORE',KEYS[1],ARGV[1]))<tonumber(ARGV[3]) then
+              return {'I',redis.call('ZSCORE',KEYS[1],ARGV[1]),redis.call('GET',KEYS[3]) or '0'}
+            end
+            local b=redis.call('ZINCRBY',KEYS[1],'-'..ARGV[3],ARGV[1])
+            if ARGV[8]~='' then redis.call('HSET',KEYS[2],ARGV[8],ARGV[1]) end
+            if redis.call('EXISTS',KEYS[3])==0 then
+              redis.call('SET',KEYS[3],redis.call('TIME')[1]..'000')
+            end
+            redis.call('INCR',KEYS[3])
+            local s=redis.call('GET',KEYS[3])
+            redis.call('PUBLISH',ARGV[6],ARGV[7]..b..';;'..s)
+            redis.call('SET',KEYS[4],ARGV[5],'EX',86400)
+            return {'O',b,s}""";
+    /**
+     * Settles a debit whose reply never came: returns 1 if it was committed, and stops it from committing later.
+     * It may run more than once for a write, when a reply is lost: the second key tells a write fenced by an earlier
+     * run from a committed one. The executor sends nothing else until it's settled, so no later write can get in between.
+     * KEYS: last applied write of this executor, last fenced write of this executor
+     * ARGV: write id
+     */
+    private static final String DEBIT_FENCE_SCRIPT = """
+            if tonumber(redis.call('GET',KEYS[1]) or '0')>=tonumber(ARGV[1]) then
+              if redis.call('GET',KEYS[2])==ARGV[1] then return 0 end
+              return 1
+            end
+            redis.call('SET',KEYS[1],ARGV[1],'EX',86400)
+            redis.call('SET',KEYS[2],ARGV[1],'EX',86400)
+            return 0""";
+    /**
+     * Puts back what Redis lost, without touching what it still has or a balance another server has already put back.
+     * KEYS: balances, sequence
+     * ARGV: account, balance, ...
+     */
+    private static final String RESEED_SCRIPT = """
+            for i=1,#ARGV,2 do redis.call('ZADD',KEYS[1],'NX',ARGV[i+1],ARGV[i]) end
+            if redis.call('EXISTS',KEYS[2])==0 then
+              redis.call('SET',KEYS[2],redis.call('TIME')[1]..'000')
+            end
+            return 1""";
+    private static final int RESEED_BATCH_SIZE = 1000;
+    protected static final long RESYNC_TIMEOUT_SECONDS = 30;
+    protected static final String DEBIT_UNAVAILABLE_MESSAGE = "Redis did not confirm the funds, try again";
+
+    protected enum DebitOutcome {
+        COMMITTED, INSUFFICIENT_FUNDS, UNAVAILABLE
+    }
+
+    /**
+     * @param balance the balance on Redis, NaN if it didn't answer
+     */
+    protected record DebitResult(DebitOutcome outcome, double balance) {
+    }
 
     protected enum WriteMode {
         DELTA("D"), SET("S"), CREATE("C");
@@ -470,19 +535,21 @@ public class Currency implements Economy {
         if (!isValidAmount(amount) || !isValidAmount(amountToWithdraw))
             return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Invalid decimal amount format");
 
-        final double newBalance;
         synchronized (playerLedger) {
             if (!hasAccount(playerUUID))
                 return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Account not found");
 
             if (!has(playerUUID, amountToWithdraw))
                 return new EconomyResponse(amountToWithdraw, getBalance(playerUUID), EconomyResponse.ResponseType.FAILURE, "Insufficient funds");
-
-            writeAccount(playerUUID, playerName, WriteMode.DELTA, -amountToWithdraw);
-            newBalance = getBalance(playerUUID);
         }
+        final DebitResult debit = debitAccount(playerUUID, playerName, amountToWithdraw);
+        if (debit.outcome() == DebitOutcome.INSUFFICIENT_FUNDS)
+            return new EconomyResponse(amountToWithdraw, debit.balance(), EconomyResponse.ResponseType.FAILURE, "Insufficient funds");
+        if (debit.outcome() == DebitOutcome.UNAVAILABLE)
+            return new EconomyResponse(amountToWithdraw, getBalance(playerUUID), EconomyResponse.ResponseType.FAILURE, DEBIT_UNAVAILABLE_MESSAGE);
+
         currenciesManager.getExchange().saveTransaction(new AccountID(playerUUID), new AccountID(), -amountToWithdraw, this, reason == null ? "Withdraw" : reason);
-        return new EconomyResponse(amount, newBalance, EconomyResponse.ResponseType.SUCCESS, null);
+        return new EconomyResponse(amount, debit.balance(), EconomyResponse.ResponseType.SUCCESS, null);
     }
 
     @SuppressWarnings("unused")
@@ -514,7 +581,7 @@ public class Currency implements Economy {
     }
 
     /**
-     * Moves the money from sender to receiver as one atomic step on this instance
+     * Moves the money from sender to receiver. Redis decides on the debit, and the receiver gets the money only after it
      */
     private EconomyResponse transfer(@NotNull UUID sender, @NotNull String senderName, @NotNull UUID receiver, @NotNull String receiverName, double amount) {
         //Calculate the amount to withdraw with the transaction tax
@@ -522,7 +589,6 @@ public class Currency implements Economy {
         if (!isValidAmount(amount) || !isValidAmount(amountToWithdraw))
             return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Invalid decimal amount format");
 
-        final double newBalance;
         synchronized (playerLedger) {
             if (!hasAccount(sender) || !hasAccount(receiver))
                 return new EconomyResponse(amount, getBalance(sender), EconomyResponse.ResponseType.FAILURE, "Account not found");
@@ -532,12 +598,15 @@ public class Currency implements Economy {
 
             if (getBalance(receiver) + amount > getPlayerMaxBalance(receiver))
                 return new EconomyResponse(0, getBalance(receiver), EconomyResponse.ResponseType.FAILURE, "The receiver has reached the maximum balance");
-
-            writeAccount(sender, senderName, WriteMode.DELTA, -amountToWithdraw);
-            writeAccount(receiver, receiverName, WriteMode.DELTA, amount);
-            newBalance = getBalance(sender);
         }
-        return new EconomyResponse(amount, newBalance, EconomyResponse.ResponseType.SUCCESS, null);
+        final DebitResult debit = debitAccount(sender, senderName, amountToWithdraw);
+        if (debit.outcome() == DebitOutcome.INSUFFICIENT_FUNDS)
+            return new EconomyResponse(0, debit.balance(), EconomyResponse.ResponseType.FAILURE, "Insufficient funds");
+        if (debit.outcome() == DebitOutcome.UNAVAILABLE)
+            return new EconomyResponse(0, getBalance(sender), EconomyResponse.ResponseType.FAILURE, DEBIT_UNAVAILABLE_MESSAGE);
+
+        writeAccount(receiver, receiverName, WriteMode.DELTA, amount);
+        return new EconomyResponse(amount, debit.balance(), EconomyResponse.ResponseType.SUCCESS, null);
     }
 
     /**
@@ -697,6 +766,125 @@ public class Currency implements Economy {
         }
     }
 
+    private DebitResult debitAccount(@NotNull UUID uuid, @Nullable String playerName, double amount) {
+        final double seed;
+        synchronized (playerLedger) {
+            seed = getBalance(uuid);
+            if (playerName != null)
+                currenciesManager.updateNameUniqueId(playerName, uuid);
+        }
+        final String name = playerName == null ? "" : playerName;
+        return debit(new BalanceWrite<>(playerLedger, uuid, uuid.toString(),
+                RedisKeys.BALANCE_PREFIX + currencyName,
+                RedisKeys.UPDATE_PLAYER_CHANNEL_PREFIX + currencyName,
+                RedisEconomyPlugin.getInstanceUUID() + ";;" + uuid + ";;" + name + ";;",
+                name, WriteMode.DELTA, -amount, seed
+        ), (int) uuid.getMostSignificantBits());
+    }
+
+    /**
+     * Asks Redis to take the money and waits for the answer, for a bounded time. It goes through the executor of the
+     * account: the writes queued before it, like a deposit, must count.
+     * Don't call it holding the ledger: the executor needs it to finish those writes.
+     *
+     * @param write      The write, with the negative amount as value
+     * @param identifier The identifier of the account
+     */
+    protected <K> DebitResult debit(@NotNull BalanceWrite<K> write, int identifier) {
+        final RedisManager redisManager = currenciesManager.getRedisManager();
+        final DebitResult unavailable = new DebitResult(DebitOutcome.UNAVAILABLE, Double.NaN);
+        if (!redisManager.canAttemptDebit()) return unavailable;
+
+        final CompletableFuture<DebitResult> answer = new CompletableFuture<>();
+        final int executorIndex = Math.floorMod(identifier, updateExecutors.size());
+        try {
+            updateExecutors.get(executorIndex).execute(() -> sendDebit(write, answer, LAST_WRITE_ID.incrementAndGet(), executorIndex));
+        } catch (RejectedExecutionException e) {
+            return unavailable; //The currency has been replaced or the plugin is disabling
+        }
+        try {
+            return answer.get(Math.max(1, RedisEconomyPlugin.getInstance().settings().debitTimeoutMillis), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            redisManager.debitNotAnswered();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException e) {
+            RedisEconomyPlugin.getInstance().getLogger().severe("Debit failed on " + write.member() + ": " + e.getCause());
+        }
+        //From here on the executor sees the refusal. If it was faster its answer is the valid one
+        answer.complete(unavailable);
+        return answer.join();
+    }
+
+    private <K> void sendDebit(@NotNull BalanceWrite<K> write, @NotNull CompletableFuture<DebitResult> answer, long writeId, int executorIndex) {
+        if (answer.isDone()) return; //Refused before it was sent
+        final RedisManager redisManager = currenciesManager.getRedisManager();
+        final String[] keys = balanceWriteKeys(write, executorIndex);
+        final List<Object> reply;
+        try {
+            reply = redisManager.getConnectionSync(connection -> connection.eval(
+                    DEBIT_SCRIPT, ScriptOutputType.MULTI, keys,
+                    write.member(), "", String.valueOf(-write.value()), String.valueOf(write.seed()),
+                    String.valueOf(writeId), write.channel(), write.messagePrefix(), write.playerName()));
+        } catch (RuntimeException e) {
+            //It may have been committed anyway, and the caller will be told it was not
+            redisManager.debitNotAnswered();
+            answer.complete(new DebitResult(DebitOutcome.UNAVAILABLE, Double.NaN));
+            settleUnansweredDebit(write, writeId, executorIndex);
+            return;
+        }
+        redisManager.debitAnswered();
+        final double balance = Double.parseDouble(String.valueOf(reply.get(1)));
+        write.ledger().update(write.key(), balance, Long.parseLong(String.valueOf(reply.get(2))));
+        if (!String.valueOf(reply.get(0)).equals("O")) {
+            answer.complete(new DebitResult(DebitOutcome.INSUFFICIENT_FUNDS, balance));
+            return;
+        }
+        RedisEconomyPlugin.debugCache("01c Debited " + write.member() + " to " + balance + " currency " + currencyName);
+        if (!answer.complete(new DebitResult(DebitOutcome.COMMITTED, balance))) refundDebit(write, executorIndex);
+    }
+
+    /**
+     * Blocks later writes of this executor until Redis tells what happened to the debit, to keep them in order
+     */
+    private <K> void settleUnansweredDebit(@NotNull BalanceWrite<K> write, long writeId, int executorIndex) {
+        final RedisEconomyPlugin plugin = RedisEconomyPlugin.getInstance();
+        final String appliedKey = balanceWriteKeys(write, executorIndex)[3];
+        final String[] fenceKeys = {appliedKey, appliedKey + ":fenced"};
+        int tries = 0;
+        while (true) {
+            try {
+                final Long committed = currenciesManager.getRedisManager().getConnectionSync(connection -> connection.eval(
+                        DEBIT_FENCE_SCRIPT, ScriptOutputType.INTEGER, fenceKeys, String.valueOf(writeId)));
+                if (committed != null && committed == 1) refundDebit(write, executorIndex);
+                return;
+            } catch (RuntimeException e) {
+                tries++;
+                if (terminated && tries >= plugin.settings().redis.getTryAgainCount() || Thread.currentThread().isInterrupted()) {
+                    plugin.getLogger().severe("A refused debit may have been committed, check it manually: account " + write.member()
+                            + " amount " + -write.value() + " currency " + currencyName);
+                    return;
+                }
+                try {
+                    Thread.sleep(Math.min(tries * 100L, 2000L));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    /**
+     * The caller was told the debit failed but Redis committed it: give the money back
+     */
+    private <K> void refundDebit(@NotNull BalanceWrite<K> write, int executorIndex) {
+        RedisEconomyPlugin.getInstance().getLogger().warning("Refunding a debit Redis committed after it was refused: account "
+                + write.member() + " amount " + -write.value() + " currency " + currencyName);
+        write.ledger().applyDelta(write.key(), -write.value());
+        writeUntilCommitted(new BalanceWrite<>(write.ledger(), write.key(), write.member(), write.balancesKey(), write.channel(),
+                write.messagePrefix(), write.playerName(), WriteMode.DELTA, -write.value(), write.seed()), LAST_WRITE_ID.incrementAndGet(), executorIndex);
+    }
+
     /**
      * Queues a write for Redis. Every account always uses the same executor, to keep its writes in order
      *
@@ -735,12 +923,7 @@ public class Currency implements Economy {
     private <K> void writeUntilCommitted(@NotNull BalanceWrite<K> write, long writeId, int executorIndex) {
         final RedisEconomyPlugin plugin = RedisEconomyPlugin.getInstance();
         final boolean absolute = write.mode() != WriteMode.DELTA;
-        final String[] keys = {
-                write.balancesKey(),
-                RedisKeys.NAME_UUID.toString(),
-                RedisKeys.BALANCE_SEQUENCE_PREFIX + currencyName,
-                RedisKeys.APPLIED_WRITE_PREFIX + currencyName + ":" + RedisEconomyPlugin.getInstanceUUID() + ":" + executorIndex
-        };
+        final String[] keys = balanceWriteKeys(write, executorIndex);
         int tries = 0;
         while (true) {
             RedisEconomyPlugin.debugCache("01a Writing " + write.member() + " " + write.mode() + " " + write.value() + " currency " + currencyName);
@@ -772,6 +955,15 @@ public class Currency implements Economy {
                 }
             }
         }
+    }
+
+    private <K> String[] balanceWriteKeys(@NotNull BalanceWrite<K> write, int executorIndex) {
+        return new String[]{
+                write.balancesKey(),
+                RedisKeys.NAME_UUID.toString(),
+                RedisKeys.BALANCE_SEQUENCE_PREFIX + currencyName,
+                RedisKeys.APPLIED_WRITE_PREFIX + currencyName + ":" + RedisEconomyPlugin.getInstanceUUID() + ":" + executorIndex
+        };
     }
 
     private <K> void abandonBalanceWrite(@NotNull BalanceWrite<K> write, boolean absolute) {
@@ -874,6 +1066,73 @@ public class Currency implements Economy {
     @SuppressWarnings("unused")
     public final Map<UUID, Double> getAccounts() {
         return Collections.unmodifiableMap(accounts);
+    }
+
+    /**
+     * Reads the balances from Redis into the local cache, as after a restart, for the updates this instance missed.
+     * It blocks: don't call it on the main thread
+     */
+    public void resyncLocal() throws ExecutionException, InterruptedException, TimeoutException {
+        final BalancesSnapshot players = readBalances(RedisKeys.BALANCE_PREFIX + currencyName);
+        players.balances().forEach((member, balance) -> playerLedger.update(UUID.fromString(member), balance, players.sequence()));
+
+        final Map<UUID, Double> maxBalances = getPlayerMaxBalances().toCompletableFuture().get(RESYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        maxPlayerBalances.keySet().retainAll(maxBalances.keySet());
+        maxPlayerBalances.putAll(maxBalances);
+    }
+
+    /**
+     * Redis lost its data: puts back the accounts this instance knows, or those nobody writes would stay missing
+     * and be lost for good when the servers restart. It blocks: don't call it on the main thread
+     */
+    public void reseedAfterDataLoss() throws ExecutionException, InterruptedException, TimeoutException {
+        final Map<String, Double> balances = new HashMap<>();
+        accounts.forEach((uuid, balance) -> balances.put(uuid.toString(), balance));
+        reseedBalances(RedisKeys.BALANCE_PREFIX + currencyName, balances);
+
+        if (maxPlayerBalances.isEmpty()) return;
+        final Map<String, String> maxBalances = new HashMap<>();
+        maxPlayerBalances.forEach((uuid, maxBalance) -> maxBalances.put(uuid.toString(), String.valueOf(maxBalance)));
+        currenciesManager.getRedisManager().getConnectionAsync(connection ->
+                        connection.hset(RedisKeys.MAX_PLAYER_BALANCES + currencyName, maxBalances))
+                .toCompletableFuture().get(RESYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    protected void reseedBalances(@NotNull String balancesKey, @NotNull Map<String, Double> balances) throws ExecutionException, InterruptedException, TimeoutException {
+        final String[] keys = {balancesKey, RedisKeys.BALANCE_SEQUENCE_PREFIX + currencyName};
+        final List<String> batch = new ArrayList<>();
+        final Iterator<Map.Entry<String, Double>> iterator = balances.entrySet().iterator();
+        while (iterator.hasNext()) {
+            final Map.Entry<String, Double> entry = iterator.next();
+            batch.add(entry.getKey());
+            batch.add(String.valueOf(entry.getValue()));
+            if (batch.size() < RESEED_BATCH_SIZE * 2 && iterator.hasNext()) continue;
+            final String[] arguments = batch.toArray(new String[0]);
+            batch.clear();
+            currenciesManager.getRedisManager().<Long>getConnectionAsync(connection -> connection.eval(
+                            RESEED_SCRIPT, ScriptOutputType.INTEGER, keys, arguments))
+                    .toCompletableFuture().get(RESYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    protected record BalancesSnapshot(long sequence, Map<String, Double> balances) {
+    }
+
+    /**
+     * Reads a balances sorted set and its sequence in one step, so an update that arrives later wins only if it's newer
+     */
+    protected BalancesSnapshot readBalances(@NotNull String balancesKey) throws ExecutionException, InterruptedException, TimeoutException {
+        final List<Object> reply = currenciesManager.getRedisManager().<List<Object>>getConnectionAsync(connection -> connection.eval(
+                "return {redis.call('GET',KEYS[2]) or '0',redis.call('ZRANGE',KEYS[1],0,-1,'WITHSCORES')}",
+                ScriptOutputType.MULTI,
+                balancesKey, RedisKeys.BALANCE_SEQUENCE_PREFIX + currencyName)
+        ).toCompletableFuture().get(RESYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        final Map<String, Double> balances = new HashMap<>();
+        final List<?> flat = (List<?>) reply.get(1);
+        for (int i = 0; i + 1 < flat.size(); i += 2) {
+            balances.put(String.valueOf(flat.get(i)), Double.parseDouble(String.valueOf(flat.get(i + 1))));
+        }
+        return new BalancesSnapshot(Long.parseLong(String.valueOf(reply.get(0))), balances);
     }
 
     /**

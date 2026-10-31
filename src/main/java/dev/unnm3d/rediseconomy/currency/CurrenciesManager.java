@@ -42,6 +42,11 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     @Getter
     private final ConcurrentHashMap<String, UUID> nameUniqueIds;
     private final ConcurrentHashMap<UUID, List<UUID>> lockedAccounts;
+    /**
+     * The value this instance knows of a key that only disappears when Redis loses its data
+     */
+    private volatile String dataEpoch;
+    private static final long RESYNC_RETRY_MILLIS = 2000;
 
 
     public CurrenciesManager(RedisManager redisManager, RedisEconomyPlugin plugin, ConfigManager configManager) {
@@ -55,6 +60,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         try {
             this.nameUniqueIds = loadRedisNameUniqueIds().toCompletableFuture().get(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS);
             this.lockedAccounts = loadLockedAccounts().toCompletableFuture().get(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS);
+            this.dataEpoch = readDataEpoch().toCompletableFuture().get(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException | ExecutionException | TimeoutException e) {
             throw new RuntimeException(e);
         }
@@ -73,6 +79,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         registerPayMsgChannel();
         registerBlockAccountChannel();
         registerUpdateChannelPattern();
+        redisManager.setReconnectTask(this::resync);
     }
 
     public void loadCurrencySystem(boolean isReload) {
@@ -333,6 +340,63 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
 
     }
 
+    private CompletionStage<String> readDataEpoch() {
+        return redisManager.<String>getConnectionAsync(connection -> connection.eval(
+                "local e=redis.call('GET',KEYS[1]) if e then return e end redis.call('SET',KEYS[1],ARGV[1]) return ARGV[1]",
+                ScriptOutputType.VALUE, new String[]{DATA_EPOCH.toString()}, UUID.randomUUID().toString()));
+    }
+
+    /**
+     * Brings this instance up to date with Redis after a time it wasn't listening, and puts back what Redis lost.
+     * Writes queued meanwhile are safe: the ledger keeps them on top of the balances read here.
+     */
+    private void resync() {
+        try {
+            final long timeout = plugin.settings().redis.timeout();
+            final String epoch = readDataEpoch().toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS);
+            if (!epoch.equals(dataEpoch)) {
+                plugin.getLogger().severe("Redis lost its data: restoring the balances known by this server. Check them with a backup");
+                for (Currency currency : getCurrencies()) currency.reseedAfterDataLoss();
+                reseedNamesAndLocks();
+                dataEpoch = epoch;
+            }
+            nameUniqueIds.putAll(loadRedisNameUniqueIds().toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS));
+            final Map<UUID, List<UUID>> locked = loadLockedAccounts().toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS);
+            lockedAccounts.keySet().retainAll(locked.keySet());
+            lockedAccounts.putAll(locked);
+            for (Currency currency : getCurrencies()) currency.resyncLocal();
+            plugin.getLogger().info("Balances synchronized with Redis");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException | TimeoutException | RuntimeException e) {
+            plugin.getLogger().warning("Can't synchronize balances with Redis, trying again: " + e);
+            redisManager.scheduleReconnectTask(RESYNC_RETRY_MILLIS);
+        }
+    }
+
+    private void reseedNamesAndLocks() throws ExecutionException, InterruptedException, TimeoutException {
+        final long timeout = plugin.settings().redis.timeout();
+        if (!nameUniqueIds.isEmpty()) {
+            final Map<String, String> names = new HashMap<>();
+            nameUniqueIds.forEach((name, uuid) -> names.put(name, uuid.toString()));
+            redisManager.getConnectionAsync(connection -> connection.hset(NAME_UUID.toString(), names))
+                    .toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS);
+        }
+        if (!lockedAccounts.isEmpty()) {
+            final Map<String, String> locks = new HashMap<>();
+            lockedAccounts.forEach((uuid, locked) -> locks.put(uuid.toString(), locked.stream().map(UUID::toString).collect(Collectors.joining(","))));
+            redisManager.getConnectionAsync(connection -> connection.hset(LOCKED_ACCOUNTS.toString(), locks))
+                    .toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Tells all instances, this one included, to read the balances again: Redis was changed without publishing updates
+     */
+    public void publishResync() {
+        redisManager.getConnectionAsync(connection -> connection.publish(RESYNC_CHANNEL.toString(), "resync"));
+    }
+
     /**
      * Switches the currency accounts of two currencies
      *
@@ -468,6 +532,11 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         StatefulRedisPubSubConnection<String, String> connection = redisManager.getPubSubConnection();
         connection.addListener(new RedisEconomyListener() {
             @Override
+            public void message(String channel, String message) {
+                if (channel.equals(RESYNC_CHANNEL.toString())) redisManager.scheduleReconnectTask(0);
+            }
+
+            @Override
             public void message(String pattern, String channel, String message) {
                 String[] split = message.split(";;");
                 if (split.length < 3) {
@@ -492,6 +561,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         });
         connection.async().psubscribe(RedisKeys.UPDATE_PLAYER_CHANNEL_PREFIX.wildcard(), RedisKeys.UPDATE_MAX_BAL_PREFIX.wildcard(),
                 RedisKeys.UPDATE_BANK_CHANNEL_PREFIX.wildcard(), UPDATE_BANK_OWNER_CHANNEL_PREFIX.wildcard());
+        connection.async().subscribe(RESYNC_CHANNEL.toString());
         RedisEconomyPlugin.debug("start1b Listening to RedisEco channel " + RedisKeys.UPDATE_PLAYER_CHANNEL_PREFIX.wildcard());
 
     }

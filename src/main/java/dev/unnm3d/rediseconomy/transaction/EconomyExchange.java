@@ -4,6 +4,8 @@ import dev.unnm3d.rediseconomy.RedisEconomyPlugin;
 import dev.unnm3d.rediseconomy.api.TransactionEvent;
 import dev.unnm3d.rediseconomy.currency.Currency;
 import dev.unnm3d.rediseconomy.redis.RedisKeys;
+import io.lettuce.core.RedisCommandExecutionException;
+import io.lettuce.core.RedisException;
 import io.lettuce.core.ScriptOutputType;
 import org.bukkit.command.CommandSender;
 import org.jetbrains.annotations.NotNull;
@@ -17,6 +19,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 public class EconomyExchange {
 
@@ -153,7 +156,7 @@ public class EconomyExchange {
                     callEvents(transactionSenderEvent, transactionReceiverEvent);
 
                     //noinspection unchecked
-                    return plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
+                    return untilRedisAnswers("payment of " + sender + " to " + target, () -> plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
                             (List<Long>) connection.eval(
                                     "local a=redis.call('incr',KEYS[1])local b=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])redis.call('hset',KEYS[3],b,ARGV[2])if tonumber(ARGV[3])>0 then redis.call('hexpire',KEYS[2],ARGV[3],'FIELDS',1,a)redis.call('hexpire',KEYS[3],ARGV[3],'FIELDS',1,b)end;return{a,b}",
                                     ScriptOutputType.MULTI,
@@ -163,7 +166,7 @@ public class EconomyExchange {
                                             RedisKeys.TRANSACTIONS + target.toString()}, //Key rediseco:transactions:playerUUID
                                     transactionSenderEvent.getTransaction().toString(),
                                     transactionReceiverEvent.getTransaction().toString(),
-                                    String.valueOf(currency.getTransactionsTTL())));
+                                    String.valueOf(currency.getTransactionsTTL()))));
                 }, executorService).orTimeout(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS)
                 .exceptionally(exc -> {
                     RedisEconomyPlugin.debug("ERROR!!!!! 03payment Exception while saving transaction for " + sender + " and " + target + ": " + exc.getMessage());
@@ -201,7 +204,7 @@ public class EconomyExchange {
                             //If target is null, it has been sent from the server
                             amount, null, reason + stackTrace));
                     callEvents(transactionEvent);
-                    return (Long) plugin.getCurrenciesManager().getRedisManager().getConnectionSync(commands -> commands.eval(
+                    return untilRedisAnswers("transaction of " + accountOwner, () -> (Long) plugin.getCurrenciesManager().getRedisManager().getConnectionSync(commands -> commands.eval(
                             "local a=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])if tonumber(ARGV[2])>0 then redis.call('hexpire',KEYS[2],ARGV[2],'FIELDS',1,a)end;return a",
                             ScriptOutputType.INTEGER,
                             new String[]{
@@ -209,10 +212,11 @@ public class EconomyExchange {
                                     RedisKeys.TRANSACTIONS + accountOwner.toString() //Key rediseco:transactions:playerUUID
                             },
                             transactionEvent.getTransaction().toString(),
-                            String.valueOf(currency.getTransactionsTTL())));
+                            String.valueOf(currency.getTransactionsTTL()))));
                 }, executorService).orTimeout(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS)
                 .exceptionally(exc -> {
-                    exc.printStackTrace();
+                    //The save goes on until Redis is back. The caller only stops waiting for its id
+                    if (!(exc instanceof TimeoutException)) exc.printStackTrace();
                     RedisEconomyPlugin.debug("ERROR!!!!! 03 Transaction Exception while saving transaction for " + accountOwner + " and " + target + ": " + exc.getMessage());
                     return (long) -1;
                 })
@@ -424,6 +428,38 @@ public class EconomyExchange {
             }
         } catch (InterruptedException e) {
             executorService.shutdownNow();
+        }
+    }
+
+    /**
+     * Saves a transaction record even if Redis is down for a while: the money has already moved.
+     * Runs on the executor, so records stay queued in memory like the balance writes.
+     * A reply lost after the commit can leave a duplicate record, never a wrong balance.
+     */
+    private <T> T untilRedisAnswers(String description, Supplier<T> save) {
+        long waitMillis = 100;
+        while (true) {
+            try {
+                return save.get();
+            } catch (RedisCommandExecutionException e) {
+                final String message = String.valueOf(e.getMessage());
+                if (!message.startsWith("LOADING") && !message.startsWith("BUSY")) throw e; //Redis refused it: it won't change
+                retryOrGiveUp(description, e, waitMillis);
+            } catch (RedisException e) { //Timeouts and lost connections: a reset comes as a plain RedisException
+                retryOrGiveUp(description, e, waitMillis);
+            }
+            waitMillis = Math.min(waitMillis * 2, 2000);
+        }
+    }
+
+    private void retryOrGiveUp(String description, RedisException cause, long waitMillis) {
+        try {
+            if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+            Thread.sleep(waitMillis);
+        } catch (InterruptedException e) { //shutdownNow from terminate()
+            plugin.getLogger().severe("LOST " + description + ": Redis did not answer before the server stopped");
+            Thread.currentThread().interrupt();
+            throw cause;
         }
     }
 

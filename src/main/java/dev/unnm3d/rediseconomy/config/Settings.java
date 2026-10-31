@@ -47,6 +47,10 @@ public class Settings {
     public int placeholderCacheUpdateInterval = 5000;
     @Comment("How many accounts to show in the %rediseco_top_number...% placeholder")
     public int baltopPlaceholderAccounts = 100;
+    @Comment({"How long a withdraw or payment waits for Redis to confirm the funds, in milliseconds",
+            "Redis decides, so two servers can't spend the same money. If it doesn't answer in time the debit is refused",
+            "It usually runs on the main thread: a higher value makes a Redis problem stall the server for longer"})
+    public int debitTimeoutMillis = 250;
     @Comment("Fixed pool size for making transactions")
     public int transactionExecutorThreads = 3;
     @Comment({"Currency name must be less than 8 characters",

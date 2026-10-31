@@ -87,6 +87,7 @@ public class BackupRestoreCommand implements CommandExecutor, TabCompleter {
                                 plugin.getLogger().info("Restored " + scoredValues.size() + " accounts for currency " + currencyName);
                             }
                         });
+                        currenciesManager.publishResync();
                     } catch (IOException e) {
                         e.printStackTrace();
                     }

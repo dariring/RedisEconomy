@@ -22,6 +22,8 @@ import dev.unnm3d.rediseconomy.utils.Metrics;
 import dev.unnm3d.rediseconomy.utils.PlaceholderAPIHook;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
+import io.lettuce.core.resource.ClientResources;
+import io.lettuce.core.resource.Delay;
 import lombok.Getter;
 import net.milkbowl.vault.economy.Economy;
 import org.bukkit.Bukkit;
@@ -210,7 +212,11 @@ public final class RedisEconomyPlugin extends JavaPlugin {
                             redisURIBuilder.withAuthentication(configManager.getSettings().redis.user(), configManager.getSettings().redis.password());
 
             getLogger().info("Connecting to redis server " + redisURIBuilder.build().toString() + "...");
-            this.redisManager = new RedisManager(RedisClient.create(redisURIBuilder.build()), configManager.getSettings().redis.getPoolSize());
+            //The default backoff reaches 30 s, and debits are refused until a connection is back
+            final ClientResources clientResources = ClientResources.builder()
+                    .reconnectDelay(Delay.exponential(Duration.ofMillis(200), Duration.ofSeconds(5), 2, TimeUnit.MILLISECONDS))
+                    .build();
+            this.redisManager = new RedisManager(RedisClient.create(clientResources, redisURIBuilder.build()), configManager.getSettings().redis.getPoolSize());
             redisManager.isConnected().get(1, java.util.concurrent.TimeUnit.SECONDS);
             if (!configManager.getSettings().clusterId.isEmpty())
                 RedisKeys.setClusterId(configManager.getSettings().clusterId);

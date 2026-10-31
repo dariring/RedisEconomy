@@ -21,6 +21,8 @@ public enum RedisKeys {
     LOCKED_ACCOUNTS("rediseco:locked"),
     UPDATE_LOCKED_ACCOUNTS("rediseco:locked"),
     UPDATE_ONLINE("rediseco:online_update"),
+    RESYNC_CHANNEL("rediseco:resync"),
+    DATA_EPOCH("rediseco:data_epoch"),
     ;
 
     private String keyName;

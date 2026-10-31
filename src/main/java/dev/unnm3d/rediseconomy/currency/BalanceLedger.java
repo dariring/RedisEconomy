@@ -122,6 +122,15 @@ final class BalanceLedger<K> {
     }
 
     /**
+     * Drops an account Redis did not have when it was at the given sequence, unless this instance wrote it since
+     */
+    synchronized void removeIfNotWrittenSince(K key, long sequence) {
+        final Entry entry = entries.get(key);
+        if (entry != null && (entry.pendingWrites > 0 || entry.sequence > sequence)) return;
+        remove(key);
+    }
+
+    /**
      * Drops the account. Acknowledgements of writes still in flight are ignored
      */
     synchronized void remove(K key) {
