@@ -1,20 +1,28 @@
 package dev.unnm3d.rediseconomy.redis;
 
 import dev.unnm3d.rediseconomy.RedisEconomyPlugin;
+import io.lettuce.core.RedisChannelHandler;
 import io.lettuce.core.RedisClient;
+import io.lettuce.core.RedisConnectionStateListener;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.async.RedisAsyncCommands;
 import io.lettuce.core.api.sync.RedisCommands;
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection;
 
+import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -24,9 +32,39 @@ public class RedisManager {
     private final RoundRobinConnectionPool<String, String> roundRobinConnectionPool;
     private final List<StatefulRedisPubSubConnection<String, String>> pubSubConnections;
     protected RedisClient lettuceRedisClient;
+    /**
+     * How long debits are refused without asking Redis after one got no answer. A hung Redis does not drop
+     * the connections, and waiting for each debit there would stall the main thread again and again
+     */
+    private static final long DEBIT_BACKOFF_MILLIS = 2000;
+    /**
+     * Pub/sub subscriptions are restored by Lettuce a moment after the connection is back
+     */
+    private static final long RESYNC_DELAY_MILLIS = 1000;
+    private volatile long debitsRefusedUntil = 0;
+    private volatile Runnable reconnectTask = () -> {
+    };
+    private final Set<RedisChannelHandler<?, ?>> disconnectedPubSubs = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean reconnectTaskScheduled = new AtomicBoolean(false);
 
     public RedisManager(RedisClient lettuceRedisClient, int poolSize) {
         this.lettuceRedisClient = lettuceRedisClient;
+        lettuceRedisClient.addListener(new RedisConnectionStateListener() {
+            @Override
+            public void onRedisDisconnected(RedisChannelHandler<?, ?> connection) {
+                if (connection instanceof StatefulRedisPubSubConnection) disconnectedPubSubs.add(connection);
+            }
+
+            @Override
+            public void onRedisConnected(RedisChannelHandler<?, ?> connection, SocketAddress socketAddress) {
+                //While a pub/sub connection was down this instance missed the updates of the others
+                if (disconnectedPubSubs.remove(connection)) scheduleReconnectTask(RESYNC_DELAY_MILLIS);
+            }
+
+            @Override
+            public void onRedisExceptionCaught(RedisChannelHandler<?, ?> connection, Throwable cause) {
+            }
+        });
         this.roundRobinConnectionPool = new RoundRobinConnectionPool<>(lettuceRedisClient::connect, poolSize);
         pubSubConnections = new CopyOnWriteArrayList<>();
     }
@@ -81,9 +119,47 @@ public class RedisManager {
         RedisEconomyPlugin.getInstance().getLogger().warning(roundRobinConnectionPool.printPool());
     }
 
+    /**
+     * @param task runs off the main thread after a pub/sub connection reconnected
+     */
+    public void setReconnectTask(Runnable task) {
+        this.reconnectTask = task;
+    }
+
+    /**
+     * Runs the reconnect task after the delay, once even if more connections come back in the meantime
+     */
+    public void scheduleReconnectTask(long delayMillis) {
+        if (!reconnectTaskScheduled.compareAndSet(false, true)) return;
+        try {
+            executorService.schedule(() -> {
+                reconnectTaskScheduled.set(false);
+                reconnectTask.run();
+            }, delayMillis, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            reconnectTaskScheduled.set(false); //Shutting down
+        }
+    }
+
+    /**
+     * @return false if asking Redis for a debit would only stall the caller
+     */
+    public boolean canAttemptDebit() {
+        return System.currentTimeMillis() >= debitsRefusedUntil && roundRobinConnectionPool.anyOpen();
+    }
+
+    public void debitNotAnswered() {
+        debitsRefusedUntil = System.currentTimeMillis() + DEBIT_BACKOFF_MILLIS;
+    }
+
+    public void debitAnswered() {
+        debitsRefusedUntil = 0;
+    }
+
     public void close() {
         pubSubConnections.forEach(StatefulRedisPubSubConnection::close);
         lettuceRedisClient.shutdown(Duration.ofSeconds(1), Duration.ofSeconds(1));
+        lettuceRedisClient.getResources().shutdown(1, 1, TimeUnit.SECONDS);
         executorService.shutdown();
     }
 

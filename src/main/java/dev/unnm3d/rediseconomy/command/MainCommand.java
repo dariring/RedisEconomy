@@ -114,9 +114,9 @@ public class MainCommand implements CommandExecutor, TabCompleter {
     private void expandPool(CommandSender sender, String arg) {
         try {
             plugin.getCurrenciesManager().getRedisManager().expandPool(Integer.parseInt(arg));
-            plugin.getConfigManager().getLangs().send(sender, "§aPool expanded successfully!");
+            sender.sendMessage("§aPool expanded successfully!"); //Language messages are MiniMessage, which refuses § codes
         } catch (Exception e) {
-            plugin.getConfigManager().getLangs().send(sender, "§cError expanding pool: " + e.getMessage());
+            sender.sendMessage("§cError expanding pool: " + e.getMessage());
         }
     }
 

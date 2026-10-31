@@ -10,11 +10,15 @@ import net.milkbowl.vault.economy.EconomyResponse;
 import org.bukkit.OfflinePlayer;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static dev.unnm3d.rediseconomy.redis.RedisKeys.*;
 
@@ -174,16 +178,22 @@ public class CurrencyWithBanks extends Currency {
     public EconomyResponse bankWithdraw(@NotNull String accountId, double amount, String reason) {
         if (!isValidAmount(amount))
             return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Invalid decimal amount format");
-        final EconomyResponse hasAmountResponse;
+        final double seed;
         synchronized (bankLedger) {
-            hasAmountResponse = bankHas(accountId, amount);
+            final EconomyResponse hasAmountResponse = bankHas(accountId, amount);
             if (hasAmountResponse.type.equals(EconomyResponse.ResponseType.FAILURE)) {
                 return hasAmountResponse;
             }
-            writeBankAccount(accountId, WriteMode.DELTA, -amount);
+            seed = bankAccounts.getOrDefault(accountId, 0.0D);
         }
+        final DebitResult debit = debit(bankWrite(accountId, WriteMode.DELTA, -amount, seed), accountId.hashCode());
+        if (debit.outcome() == DebitOutcome.INSUFFICIENT_FUNDS)
+            return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, "Not enough money");
+        if (debit.outcome() == DebitOutcome.UNAVAILABLE)
+            return new EconomyResponse(0, 0, EconomyResponse.ResponseType.FAILURE, DEBIT_UNAVAILABLE_MESSAGE);
+
         currenciesManager.getExchange().saveTransaction(new AccountID(accountId), new AccountID(), -amount, this, reason);
-        return new EconomyResponse(amount, hasAmountResponse.balance, EconomyResponse.ResponseType.SUCCESS, null); //Balance is the new balance with subtracted amount
+        return new EconomyResponse(amount, debit.balance(), EconomyResponse.ResponseType.SUCCESS, null); //Balance is the new balance with subtracted amount
 
     }
 
@@ -306,13 +316,42 @@ public class CurrencyWithBanks extends Currency {
             if (mode == WriteMode.DELTA) bankLedger.applyDelta(accountId, value);
             else bankLedger.applySet(accountId, value);
 
-            enqueueBalanceWrite(new BalanceWrite<>(bankLedger, accountId, accountId,
-                    BALANCE_BANK_PREFIX + currencyName,
-                    UPDATE_BANK_CHANNEL_PREFIX + currencyName,
-                    RedisEconomyPlugin.getInstanceUUID() + ";;" + accountId + ";;",
-                    "", mode, value, seed
-            ), accountId.hashCode());
+            enqueueBalanceWrite(bankWrite(accountId, mode, value, seed), accountId.hashCode());
         }
+    }
+
+    private BalanceWrite<String> bankWrite(@NotNull String accountId, @NotNull WriteMode mode, double value, double seed) {
+        return new BalanceWrite<>(bankLedger, accountId, accountId,
+                BALANCE_BANK_PREFIX + currencyName,
+                UPDATE_BANK_CHANNEL_PREFIX + currencyName,
+                RedisEconomyPlugin.getInstanceUUID() + ";;" + accountId + ";;",
+                "", mode, value, seed
+        );
+    }
+
+    @Override
+    public void resyncLocal() throws ExecutionException, InterruptedException, TimeoutException {
+        super.resyncLocal();
+        final BalancesSnapshot banks = readBalances(BALANCE_BANK_PREFIX + currencyName);
+        banks.balances().forEach((accountId, balance) -> bankLedger.update(accountId, balance, banks.sequence()));
+        //A bank deleted by another server while this one wasn't listening
+        bankAccounts.keySet().stream().filter(accountId -> !banks.balances().containsKey(accountId)).toList()
+                .forEach(accountId -> bankLedger.removeIfNotWrittenSince(accountId, banks.sequence()));
+
+        final Map<String, String> owners = getRedisBankOwners().toCompletableFuture().get(RESYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        bankOwners.keySet().removeIf(accountId -> !owners.containsKey(accountId) && !bankAccounts.containsKey(accountId));
+        owners.forEach((accountId, owner) -> bankOwners.put(accountId, UUID.fromString(owner)));
+    }
+
+    @Override
+    public void reseedAfterDataLoss() throws ExecutionException, InterruptedException, TimeoutException {
+        super.reseedAfterDataLoss();
+        reseedBalances(BALANCE_BANK_PREFIX + currencyName, new HashMap<>(bankAccounts));
+        if (bankOwners.isEmpty()) return;
+        final Map<String, String> owners = new HashMap<>();
+        bankOwners.forEach((accountId, owner) -> owners.put(accountId, owner.toString()));
+        currenciesManager.getRedisManager().getConnectionAsync(connection -> connection.hset(BANK_OWNERS.toString(), owners))
+                .toCompletableFuture().get(RESYNC_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     /**
