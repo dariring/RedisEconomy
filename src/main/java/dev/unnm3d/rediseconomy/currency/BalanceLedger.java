@@ -21,6 +21,10 @@ final class BalanceLedger<K> {
 
     private final ConcurrentHashMap<K, Double> balances;
     private final Map<K, Entry> entries = new HashMap<>();
+    /**
+     * The highest sequence this instance has seen. Redis going below it means it was rolled back
+     */
+    private volatile long highestSequence = 0;
 
     BalanceLedger(ConcurrentHashMap<K, Double> balances) {
         this.balances = balances;
@@ -42,6 +46,53 @@ final class BalanceLedger<K> {
             entries.put(key, entry);
         }
         return entry;
+    }
+
+    synchronized long sequenceOf(K key) {
+        final Entry entry = entries.get(key);
+        return entry == null ? 0 : entry.sequence;
+    }
+
+    long highestSequence() {
+        return highestSequence;
+    }
+
+    private void sawSequence(long sequence) {
+        if (sequence > highestSequence) highestSequence = sequence;
+    }
+
+    /**
+     * @return true if a set is on its way to Redis: what comes after it must reach Redis after it
+     */
+    synchronized boolean hasPendingSet(K key) {
+        final Entry entry = entries.get(key);
+        return entry != null && entry.pendingSets > 0;
+    }
+
+    /**
+     * @return true if a write of this account has not reached Redis yet
+     */
+    synchronized boolean hasPendingWrites(K key) {
+        final Entry entry = entries.get(key);
+        return entry != null && entry.pendingWrites > 0;
+    }
+
+    /**
+     * A committed balance and how recent it is
+     */
+    record Committed(double balance, long sequence) {
+    }
+
+    /**
+     * What this instance knows Redis had committed. Writes still in flight are left out: they will reach Redis on top
+     */
+    synchronized Map<K, Committed> committedBalances() {
+        final Map<K, Committed> committed = new HashMap<>();
+        balances.forEach((key, balance) -> {
+            final Entry entry = entries.get(key);
+            committed.put(key, entry == null ? new Committed(balance, 0) : new Committed(entry.committed, entry.sequence));
+        });
+        return committed;
     }
 
     private void publishLocal(K key, Entry entry) {
@@ -81,6 +132,7 @@ final class BalanceLedger<K> {
         final Entry entry = entries.get(key);
         if (entry == null) return; //Account deleted while the write was in flight
         finishWrite(entry, absolute, delta);
+        sawSequence(sequence);
         if (sequence > entry.sequence) {
             entry.sequence = sequence;
             entry.committed = balance;
@@ -114,6 +166,7 @@ final class BalanceLedger<K> {
         final Entry entry = entry(key);
         if (sequence != UNSEQUENCED) {
             //An older update, delivered late. Equal is a read of the current state, also after a change without sequence (restore)
+            sawSequence(sequence);
             if (sequence < entry.sequence) return;
             entry.sequence = sequence;
         }

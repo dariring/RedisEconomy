@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 public class EconomyExchange {
@@ -27,6 +28,11 @@ public class EconomyExchange {
 
     private final RedisEconomyPlugin plugin;
     private final ExecutorService executorService;
+    /**
+     * Each worker sends one record at a time with a higher id, so a record seen on Redis again is a retry.
+     * Shared with nothing else, and never reset while this instance runs
+     */
+    private final AtomicLong lastRecordId = new AtomicLong();
     private long updateTIDTimestamp = System.currentTimeMillis();
     private int lastTID = 0;
 
@@ -155,18 +161,21 @@ public class EconomyExchange {
 
                     callEvents(transactionSenderEvent, transactionReceiverEvent);
 
+                    final long recordId = lastRecordId.incrementAndGet();
                     //noinspection unchecked
                     return untilRedisAnswers("payment of " + sender + " to " + target, () -> plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
                             (List<Long>) connection.eval(
-                                    "local a=redis.call('incr',KEYS[1])local b=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])redis.call('hset',KEYS[3],b,ARGV[2])if tonumber(ARGV[3])>0 then redis.call('hexpire',KEYS[2],ARGV[3],'FIELDS',1,a)redis.call('hexpire',KEYS[3],ARGV[3],'FIELDS',1,b)end;return{a,b}",
+                                    "local v=redis.call('get',KEYS[4])if v then local i,a,b=string.match(v,'(%d+),(%d+),(%d+)')if tonumber(i)>=tonumber(ARGV[4])then return{tonumber(a),tonumber(b)}end end;local a=redis.call('incr',KEYS[1])local b=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])redis.call('hset',KEYS[3],b,ARGV[2])if tonumber(ARGV[3])>0 then redis.call('hexpire',KEYS[2],ARGV[3],'FIELDS',1,a)redis.call('hexpire',KEYS[3],ARGV[3],'FIELDS',1,b)end;redis.call('set',KEYS[4],ARGV[4]..','..a..','..b,'EX',86400)return{a,b}",
                                     ScriptOutputType.MULTI,
                                     new String[]{
                                             RedisKeys.TRANSACTIONS_COUNTER.toString(),
                                             RedisKeys.TRANSACTIONS + sender.toString(),
-                                            RedisKeys.TRANSACTIONS + target.toString()}, //Key rediseco:transactions:playerUUID
+                                            RedisKeys.TRANSACTIONS + target.toString(), //Key rediseco:transactions:playerUUID
+                                            appliedRecordKey()},
                                     transactionSenderEvent.getTransaction().toString(),
                                     transactionReceiverEvent.getTransaction().toString(),
-                                    String.valueOf(currency.getTransactionsTTL()))));
+                                    String.valueOf(currency.getTransactionsTTL()),
+                                    String.valueOf(recordId))));
                 }, executorService).orTimeout(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS)
                 .exceptionally(exc -> {
                     RedisEconomyPlugin.debug("ERROR!!!!! 03payment Exception while saving transaction for " + sender + " and " + target + ": " + exc.getMessage());
@@ -204,15 +213,18 @@ public class EconomyExchange {
                             //If target is null, it has been sent from the server
                             amount, null, reason + stackTrace));
                     callEvents(transactionEvent);
+                    final long recordId = lastRecordId.incrementAndGet();
                     return untilRedisAnswers("transaction of " + accountOwner, () -> (Long) plugin.getCurrenciesManager().getRedisManager().getConnectionSync(commands -> commands.eval(
-                            "local a=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])if tonumber(ARGV[2])>0 then redis.call('hexpire',KEYS[2],ARGV[2],'FIELDS',1,a)end;return a",
+                            "local v=redis.call('get',KEYS[3])if v then local i,a=string.match(v,'(%d+),(%d+)')if tonumber(i)>=tonumber(ARGV[3])then return tonumber(a)end end;local a=redis.call('incr',KEYS[1])redis.call('hset',KEYS[2],a,ARGV[1])if tonumber(ARGV[2])>0 then redis.call('hexpire',KEYS[2],ARGV[2],'FIELDS',1,a)end;redis.call('set',KEYS[3],ARGV[3]..','..a..',0','EX',86400)return a",
                             ScriptOutputType.INTEGER,
                             new String[]{
                                     RedisKeys.TRANSACTIONS_COUNTER.toString(),
-                                    RedisKeys.TRANSACTIONS + accountOwner.toString() //Key rediseco:transactions:playerUUID
+                                    RedisKeys.TRANSACTIONS + accountOwner.toString(), //Key rediseco:transactions:playerUUID
+                                    appliedRecordKey()
                             },
                             transactionEvent.getTransaction().toString(),
-                            String.valueOf(currency.getTransactionsTTL()))));
+                            String.valueOf(currency.getTransactionsTTL()),
+                            String.valueOf(recordId))));
                 }, executorService).orTimeout(plugin.getConfigManager().getSettings().redis.timeout(), TimeUnit.MILLISECONDS)
                 .exceptionally(exc -> {
                     //The save goes on until Redis is back. The caller only stops waiting for its id
@@ -432,9 +444,16 @@ public class EconomyExchange {
     }
 
     /**
+     * The last record this worker saved. Workers are the threads of the executor, which outlive every record
+     */
+    private String appliedRecordKey() {
+        return RedisKeys.APPLIED_RECORD_PREFIX.toString() + RedisEconomyPlugin.getInstanceUUID() + ":" + Thread.currentThread().threadId();
+    }
+
+    /**
      * Saves a transaction record even if Redis is down for a while: the money has already moved.
      * Runs on the executor, so records stay queued in memory like the balance writes.
-     * A reply lost after the commit can leave a duplicate record, never a wrong balance.
+     * The id in the script makes a retry safe when the reply of a saved record was lost.
      */
     private <T> T untilRedisAnswers(String description, Supplier<T> save) {
         long waitMillis = 100;

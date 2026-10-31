@@ -47,6 +47,18 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
      */
     private volatile String dataEpoch;
     private static final long RESYNC_RETRY_MILLIS = 2000;
+    /**
+     * How often to look for a Redis that lost its data or went back in time with the connections up
+     */
+    private static final long DATA_CHECK_MILLIS = 5000;
+    /**
+     * Bump it when instances of different versions can't share Redis safely
+     */
+    private static final int PROTOCOL_VERSION = 3;
+    private static final int INSTANCE_TTL_SECONDS = 30;
+    private static final long INSTANCE_RECHECK_MILLIS = 7000;
+    private static final long OLD_INSTANCE_WARNING_MILLIS = 60_000;
+    private final Map<String, Long> instancesChecked = new ConcurrentHashMap<>();
 
 
     public CurrenciesManager(RedisManager redisManager, RedisEconomyPlugin plugin, ConfigManager configManager) {
@@ -80,6 +92,101 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         registerBlockAccountChannel();
         registerUpdateChannelPattern();
         redisManager.setReconnectTask(this::resync);
+        checkEvictionPolicy();
+        registerInstance();
+        redisManager.scheduleRepeating(this::checkDataState, DATA_CHECK_MILLIS);
+    }
+
+    /**
+     * Redis can't tell which balances an eviction removed, so it must not evict at all
+     */
+    private void checkEvictionPolicy() {
+        try {
+            final Map<String, String> config = redisManager.<Map<String, String>>getConnectionAsync(connection -> connection.configGet("maxmemory-policy"))
+                    .toCompletableFuture().get(plugin.settings().redis.timeout(), TimeUnit.MILLISECONDS);
+            final String policy = config.get("maxmemory-policy");
+            if (policy == null) {
+                plugin.getLogger().warning("Can't read maxmemory-policy from Redis. It must be noeviction, or balances may disappear");
+            } else if (!policy.equals("noeviction")) {
+                plugin.getLogger().severe("Redis maxmemory-policy is " + policy + ": Redis may evict balances and RedisEconomy can't notice it. Set it to noeviction");
+            }
+        } catch (ExecutionException | TimeoutException | RuntimeException e) {
+            plugin.getLogger().warning("Can't read maxmemory-policy from Redis (CONFIG may be denied), carrying on. It must be noeviction, or balances may disappear: " + e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void registerInstance() {
+        redisManager.getConnectionAsync(connection -> connection.setex(
+                INSTANCE_PREFIX + RedisEconomyPlugin.getInstanceUUID().toString(), INSTANCE_TTL_SECONDS, String.valueOf(PROTOCOL_VERSION)));
+    }
+
+    /**
+     * An instance older than this one doesn't register itself, or registers a lower version.
+     * The key may be missing for a moment after a data loss, so a missing key is looked at again later.
+     */
+    private void checkInstance(String instanceId, boolean secondLook) {
+        final long now = System.currentTimeMillis();
+        if (!secondLook) {
+            final Long last = instancesChecked.get(instanceId);
+            if (last != null && now - last < OLD_INSTANCE_WARNING_MILLIS) return;
+            instancesChecked.put(instanceId, now);
+        }
+        redisManager.getConnectionAsync(connection -> connection.get(INSTANCE_PREFIX + instanceId)).thenAccept(version -> {
+            if (version == null && !secondLook) {
+                redisManager.scheduleOnce(() -> checkInstance(instanceId, true), INSTANCE_RECHECK_MILLIS);
+            } else if (version == null || Integer.parseInt(version) < PROTOCOL_VERSION) {
+                warnOldInstance(instanceId);
+            }
+        });
+    }
+
+    private void warnOldInstance(String instanceId) {
+        plugin.getLogger().severe("A server with an older RedisEconomy is sharing this Redis (instance " + instanceId + "). It can overdraw accounts and, "
+                + "if older still, overwrite balances. Upgrade all servers to the same version NOW");
+    }
+
+    /**
+     * An update from after a data loss this instance hasn't noticed yet would replace the balance it has to put back,
+     * maybe with an older one from a server that had missed updates. The resync that follows reads it anyway.
+     */
+    boolean acceptsDataEpoch(String epoch) {
+        if (epoch.equals(dataEpoch)) return true;
+        redisManager.scheduleReconnectTask(0);
+        return false;
+    }
+
+    /**
+     * Notices a Redis that lost its data or went back to an older snapshot, even if no connection dropped.
+     * Runs off the main thread.
+     */
+    private void checkDataState() {
+        registerInstance();
+        final List<Currency> currencyList = new ArrayList<>(getCurrencies());
+        final Map<Currency, Long> seen = new HashMap<>();
+        //Read before Redis: what this instance has seen by now can't be above Redis unless Redis went back
+        currencyList.forEach(currency -> seen.put(currency, currency.highestSeenSequence()));
+        final String[] keys = new String[currencyList.size() + 1];
+        keys[0] = DATA_EPOCH.toString();
+        for (int i = 0; i < currencyList.size(); i++) keys[i + 1] = currencyList.get(i).sequenceKey();
+        final List<Object> reply;
+        try {
+            reply = redisManager.<List<Object>>getConnectionAsync(connection -> connection.eval(
+                            "local r={redis.call('GET',KEYS[1]) or ''} for i=2,#KEYS do r[i]=redis.call('GET',KEYS[i]) or '0' end return r",
+                            ScriptOutputType.MULTI, keys))
+                    .toCompletableFuture().get(plugin.settings().redis.timeout(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        } catch (ExecutionException | TimeoutException | RuntimeException e) {
+            return; //Redis is unreachable: the reconnection will start a resync
+        }
+        boolean changed = !String.valueOf(reply.get(0)).equals(dataEpoch);
+        for (int i = 0; i < currencyList.size(); i++) {
+            changed |= Long.parseLong(String.valueOf(reply.get(i + 1))) < seen.get(currencyList.get(i));
+        }
+        if (changed) redisManager.scheduleReconnectTask(0);
     }
 
     public void loadCurrencySystem(boolean isReload) {
@@ -354,11 +461,26 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
         try {
             final long timeout = plugin.settings().redis.timeout();
             final String epoch = readDataEpoch().toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS);
+            boolean othersMustResync = false;
             if (!epoch.equals(dataEpoch)) {
                 plugin.getLogger().severe("Redis lost its data: restoring the balances known by this server. Check them with a backup");
                 for (Currency currency : getCurrencies()) currency.reseedAfterDataLoss();
                 reseedNamesAndLocks();
                 dataEpoch = epoch;
+                registerInstance();
+                othersMustResync = true;
+            } else {
+                for (Currency currency : getCurrencies()) {
+                    final long seen = currency.highestSeenSequence();
+                    final String sequence = redisManager.<String>getConnectionAsync(connection -> connection.get(currency.sequenceKey()))
+                            .toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS);
+                    if (sequence == null ? seen > 0 : Long.parseLong(sequence) < seen) {
+                        plugin.getLogger().severe("Redis went back to an older state on currency " + currency.getCurrencyName()
+                                + ": taking its balances as they are, later changes are gone. Check them with a backup");
+                        currency.acceptRollback();
+                        othersMustResync = true;
+                    }
+                }
             }
             nameUniqueIds.putAll(loadRedisNameUniqueIds().toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS));
             final Map<UUID, List<UUID>> locked = loadLockedAccounts().toCompletableFuture().get(timeout, TimeUnit.MILLISECONDS);
@@ -366,6 +488,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
             lockedAccounts.putAll(locked);
             for (Currency currency : getCurrencies()) currency.resyncLocal();
             plugin.getLogger().info("Balances synchronized with Redis");
+            if (othersMustResync) publishResync();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (ExecutionException | TimeoutException | RuntimeException e) {
@@ -545,6 +668,7 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
                 }
                 //0 instanceID, 1 playerUUID, 2 playerName/maxBal, 3 balance/emtpty/empty (if applicable)
                 if (split[0].equals(RedisEconomyPlugin.getInstanceUUID().toString())) return;
+                checkInstance(split[0], false);
                 final String[] updateArgs = Arrays.copyOfRange(split, 1, split.length);
                 for (Currency currency : getCurrencies()) {
                     String name = currency.getCurrencyName();

@@ -23,6 +23,8 @@ public enum RedisKeys {
     UPDATE_ONLINE("rediseco:online_update"),
     RESYNC_CHANNEL("rediseco:resync"),
     DATA_EPOCH("rediseco:data_epoch"),
+    INSTANCE_PREFIX("rediseco:instance:"),
+    APPLIED_RECORD_PREFIX("rediseco:applied_record:"),
     ;
 
     private String keyName;
